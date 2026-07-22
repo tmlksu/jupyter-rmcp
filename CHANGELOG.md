@@ -27,6 +27,11 @@ First public release.
 - `/health` reports `colab_only`.
 - The Colab backend is now offered only when the credentials file actually
   exists, not merely when the environment variable is set.
+- **`GCLOUD_ADC` must be set explicitly** to use Colab. It previously defaulted
+  to a path in `compose.yaml`; the default is now `/dev/null`, so an instance
+  that relied on the old one silently loses the Colab backend — or, with
+  `COLAB_ONLY=1`, refuses to start. Put the absolute path to the file
+  `gcloud auth application-default login` writes into `.env`.
 - Documentation and configuration were generalized for public use: auth is
   documented as "set `MCP_BEARER`, or put an authenticating proxy in front"
   rather than assuming one specific provider, and `scripts/install.sh` generates
