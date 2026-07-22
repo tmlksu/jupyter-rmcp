@@ -1,0 +1,25 @@
+# Slim Jupyter Server for COLAB_ONLY deployments (small VMs: 1 GB RAM class).
+#
+# In colab-only mode this container never runs user code — it is the notebook
+# STORE (Contents API) plus JupyterLab for a human. So it needs no kernel and no
+# scientific stack, which is the difference between a ~1.3 GB image built from
+# the docker-stacks base and this one. Build it where RAM is scarce; the default
+# Dockerfile stays the right choice anywhere local execution is allowed.
+FROM python:3.12-slim
+
+# Match the docker-stacks layout so volumes, paths and uid are interchangeable
+# between this image and the default one (uid 1000, gid 100 "users").
+RUN groupadd -g 100 users 2>/dev/null || true; \
+    useradd -m -u 1000 -g 100 -s /bin/bash jovyan && \
+    mkdir -p /home/jovyan/work /home/jovyan/kaggle && \
+    chown -R 1000:100 /home/jovyan
+
+RUN pip install --no-cache-dir jupyterlab==4.* && \
+    find /usr/local -name '__pycache__' -type d -prune -exec rm -rf {} +
+
+COPY jupyter_server_config.py /etc/jupyter/jupyter_server_config.py
+
+USER 1000
+WORKDIR /home/jovyan
+EXPOSE 8888
+CMD ["jupyter", "lab", "--config=/etc/jupyter/jupyter_server_config.py"]

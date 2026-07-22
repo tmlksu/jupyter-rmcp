@@ -3,7 +3,16 @@
 # container on the compose network). The only internet-facing surface is the
 # MCP server. Auth to this server is the shared JUPYTER_TOKEN (set via env by
 # the docker-stacks start script as --IdentityProvider.token).
+import os
+
 c = get_config()  # noqa: F821
+
+# The docker-stacks base image passes --IdentityProvider.token on the command
+# line (CLI wins over this file, so setting it here changes nothing there). The
+# slim image has no such start script, so read the env ourselves — one config
+# file serves both.
+if os.environ.get("JUPYTER_TOKEN"):
+    c.IdentityProvider.token = os.environ["JUPYTER_TOKEN"]
 
 c.ServerApp.ip = "0.0.0.0"                 # listen on the container network iface
 c.ServerApp.port = 8888

@@ -45,6 +45,8 @@ settled decision — most surprising choices here have a recorded reason.
 | Architecture, session management, reaper, write-back | `DESIGN.md` |
 | Exposing it safely, Claude connector auth | `docs/AUTH.md` |
 | IAP + OAuth setup runbook (Claude mobile app) | `docs/IAP-OAUTH.md` |
+| Deploying on a GCE free-tier VM (agent-executable) | `docs/deploy/gce-cloudflare.md` |
+| Account/API prerequisites, in Japanese | `docs/ja/setup.md` |
 | Threat model | `docs/SECURITY.md` |
 | Colab GPU offload internals | `docs/COLAB.md` |
 | Why a decision was made | `docs/adr/` |

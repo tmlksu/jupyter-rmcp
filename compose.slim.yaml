@@ -1,0 +1,20 @@
+# Overlay for COLAB_ONLY deployments on a small VM (1 GB RAM class, e.g. a GCE
+# e2-micro free-tier instance). Swaps the notebook store for the slim image —
+# no kernel, no scientific stack, ~1/5 the size — and lowers the memory cap to
+# something a 1 GB host can actually honour.
+#
+#   docker compose -f compose.yaml -f compose.slim.yaml up -d --build
+#
+# Only use this with COLAB_ONLY=1. This image cannot run local kernels, so a
+# normal deployment would appear to start and then fail on start_kernel.
+services:
+  jupyter:
+    build:
+      context: ./jupyter
+      dockerfile: Dockerfile.slim
+    image: jrmcp-jupyter-slim:latest
+    mem_limit: 512m
+    cpus: 1.0
+
+  mcp:
+    mem_limit: 256m

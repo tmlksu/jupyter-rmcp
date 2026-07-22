@@ -11,6 +11,10 @@ machine, which a human can watch and edit in JupyterLab at the same time.
 
 - **Kaggle on a laptop:** `COLAB_ONLY=1` makes every kernel a Colab VM under
   your own Google account — nothing executes locally. See [docs/GUIDE.md](docs/GUIDE.md).
+- **Kaggle from your phone:** the same mode fits a free-tier GCE `e2-micro`
+  (~475 MB of 1 GB used), published to the Claude app through a Cloudflare
+  tunnel — [docs/deploy/gce-cloudflare.md](docs/deploy/gce-cloudflare.md),
+  with the account prerequisites in [日本語](docs/ja/setup.md).
 - **Reference:** [DESIGN.md](DESIGN.md) (architecture, session management),
   [docs/AUTH.md](docs/AUTH.md) (exposing it safely) and
   [docs/IAP-OAUTH.md](docs/IAP-OAUTH.md) (the runbook for reaching it from the
