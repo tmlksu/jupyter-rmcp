@@ -1,0 +1,2 @@
+[rmcp-a1b2c3d4] https://abc123-colab.googleusercontent.com/tun/m/gpu-t4 | Hardware: T4 | Variant: GPU
+[rmcp-e5f6a7b8] https://def456-colab.googleusercontent.com/tun/m/cpu | Hardware: CPU | Variant: DEFAULT

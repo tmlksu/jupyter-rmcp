@@ -1,0 +1,5 @@
+fastmcp==3.4.4
+jupyter-kernel-client==0.9.0
+httpx==0.28.1
+uvicorn==0.51.0
+google-colab-cli==0.6.0

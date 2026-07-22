@@ -1,0 +1,22 @@
+# Tool config only — this repo is NOT a Python package (no [project] table on purpose).
+# Tests + lint gate the refactor phases; see docs/refactor/README.md.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["mcp"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+extend-exclude = ["data"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.isort]
+# The mcp package modules, importable in tests via pythonpath = ["mcp"].
+known-first-party = [
+    "app", "config", "state", "outputs", "util", "registry",
+    "backends", "kernels", "notebook", "jobs", "workspace", "reaper", "server",
+]

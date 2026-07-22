@@ -1,0 +1,6 @@
+# Dev/test-only deps (host venv + CI). Runtime deps live in mcp/requirements.txt.
+# fastmcp pin MUST match mcp/requirements.txt (smoke_test.py + in-memory tool-surface test).
+pytest==9.1.1
+pytest-asyncio==1.4.0
+ruff==0.15.22
+fastmcp==3.4.4

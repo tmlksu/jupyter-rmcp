@@ -1,0 +1,5 @@
+[colab] Fetching sessions from server...
+[rmcp-11223344] https://jkl012-colab.googleusercontent.com/tun/m/a100 | Hardware: A100 | Variant: GPU
+[colab] Using ADC credentials
+Some unrelated status line without brackets
+[rmcp-55667788] https://mno345-colab.googleusercontent.com/tun/m/cpu | Hardware: CPU | Variant: DEFAULT

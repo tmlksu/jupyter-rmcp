@@ -1,0 +1,97 @@
+# jupyter-rmcp — Dockerized Jupyter execution env exposed to Claude via MCP.
+# Conventions: every host port binds 127.0.0.1 only, all state is bind-mounted
+# under ./data, and anything internet-facing goes through a reverse proxy or
+# tunnel you put in front of the MCP port yourself (see docs/AUTH.md).
+name: jupyter-rmcp
+
+services:
+  # Execution backend. INTERNAL-ONLY: no `ports:`, reachable only by `mcp`
+  # over the private compose network.
+  jupyter:
+    build: ./jupyter
+    image: jrmcp-jupyter:latest
+    container_name: jrmcp-jupyter
+    restart: unless-stopped
+    environment:
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN}
+      # Kaggle API creds (server-side only; never sent to the client). Notebook
+      # code uses `!kaggle datasets download ...`. Set in .env.
+      # Current method: single token. Legacy username+key kept as optional fallback.
+      - KAGGLE_API_TOKEN=${KAGGLE_API_TOKEN:-}
+      - KAGGLE_USERNAME=${KAGGLE_USERNAME:-}
+      - KAGGLE_KEY=${KAGGLE_KEY:-}
+    volumes:
+      - ./data/notebooks:/home/jovyan/work
+      # Dedicated download dir (keeps big Kaggle data out of the notebooks tree).
+      - ./data/kaggle:/home/jovyan/kaggle
+    # Loopback-only host port so a human can open JupyterLab in a browser (and see
+    # what Claude is doing). MCP still talks to Jupyter over the internal network.
+    ports:
+      - "127.0.0.1:${JUPYTER_LAB_HOST_PORT:-7131}:8888"
+    networks: [internal]
+    mem_limit: 2g
+    cpus: 2.0
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8888/api').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # MCP server. The only surface meant to be exposed beyond this host. Talks to
+  # the internal Jupyter over REST+WS using JUPYTER_TOKEN.
+  mcp:
+    build: ./mcp
+    image: jrmcp-mcp:latest
+    container_name: jrmcp-mcp
+    restart: unless-stopped
+    depends_on:
+      jupyter:
+        condition: service_healthy
+    # Run as the host user so colab-cli can read the ADC creds (mode 600, host-owned).
+    # Override in .env if your account is not uid/gid 1000 (`id -u`, `id -g`).
+    user: "${MCP_UID:-1000}:${MCP_GID:-1000}"
+    environment:
+      - HOME=/data-colab
+      - JUPYTER_URL=http://jupyter:8888
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN}
+      - MCP_BEARER=${MCP_BEARER}
+      - MCP_PORT=8000
+      # Colab-only deployment: refuse to execute code on the local backend (the local
+      # Jupyter still stores/serves the notebooks). Requires working ADC creds below.
+      - COLAB_ONLY=${COLAB_ONLY:-}
+      - EXEC_TIMEOUT_SEC=${EXEC_TIMEOUT_SEC}
+      - KERNEL_IDLE_TIMEOUT_SEC=${KERNEL_IDLE_TIMEOUT_SEC}
+      - KERNEL_MAX_AGE_SEC=${KERNEL_MAX_AGE_SEC}
+      - MAX_KERNELS=${MAX_KERNELS}
+      # Colab keep-alive ping interval (s); backs up colab-cli's daemon which dies on
+      # container restart. 0 disables. Bounded by KERNEL_MAX_AGE_SEC.
+      - COLAB_HEARTBEAT_SEC=${COLAB_HEARTBEAT_SEC:-300}
+      # Persistent kernel registry (survives mcp restart/rebuild). See PHASE-1.
+      - MCP_STATE_DIR=/state
+      # colab-cli (official Colab GPU offload). ADC creds mounted read-only.
+      - GOOGLE_APPLICATION_CREDENTIALS=/creds/adc.json
+      # Kaggle creds for `colab_setup_kaggle` (inject into a Colab session on demand).
+      - KAGGLE_API_TOKEN=${KAGGLE_API_TOKEN:-}
+      - KAGGLE_USERNAME=${KAGGLE_USERNAME:-}
+      - KAGGLE_KEY=${KAGGLE_KEY:-}
+      # HuggingFace token for `setup_hf` (masked-inject into a Colab session on demand).
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    volumes:
+      # Google ADC credentials for colab-cli (read-only). Set GCLOUD_ADC in .env to the
+      # file `gcloud auth application-default login` writes. The /dev/null default keeps
+      # compose valid without Colab: it is not a regular file, so the server sees no
+      # credentials and simply does not offer the colab backend.
+      - ${GCLOUD_ADC:-/dev/null}:/creds/adc.json:ro
+      # colab-cli HOME (writable, persisted). colab-cli writes ~/.config/colab-cli here.
+      - ./data/colab-cli:/data-colab
+      # Persistent kernel registry (kernels.json). Survives restart/rebuild.
+      - ./data/mcp-state:/state
+    ports:
+      - "127.0.0.1:${MCP_HOST_PORT}:8000"
+    networks: [internal]
+
+networks:
+  internal:
+    driver: bridge

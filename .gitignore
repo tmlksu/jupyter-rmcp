@@ -1,0 +1,19 @@
+.env
+.venv/
+.pytest_cache/
+.ruff_cache/
+data/notebooks/*
+!data/notebooks/.gitkeep
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+secrets/
+# Deployment-specific tooling for one operator's own infrastructure (tunnel/proxy
+# configs, identity-provider policy scripts). Never publishable, never required.
+deploy.local/
+# Local agent/editor settings; may contain absolute paths from this machine.
+.claude/
+data/colab-cli/
+data/kaggle/*
+!data/kaggle/.gitkeep
+data/mcp-state/

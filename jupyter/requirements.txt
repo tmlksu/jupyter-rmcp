@@ -1,0 +1,8 @@
+# Default scientific stack available in every kernel. Extend as needed, then rebuild.
+numpy
+pandas
+matplotlib
+requests
+ipywidgets
+kaggle
+kagglehub

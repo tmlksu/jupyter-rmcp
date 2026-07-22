@@ -1,0 +1,24 @@
+# Lint + unit tests only — no Docker, no live server, no network in tests.
+# The E2E gate (scripts/smoke_test.py) runs on the deployment host against the running stack.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12" # matches mcp/Dockerfile
+          cache: pip
+          cache-dependency-path: |
+            mcp/requirements.txt
+            requirements-dev.txt
+      - run: pip install -r mcp/requirements.txt -r requirements-dev.txt
+      - run: ruff check .
+      - run: pytest -q
