@@ -3,7 +3,9 @@
 This server executes arbitrary code. A reachable, unauthenticated `/mcp`
 endpoint is a remote shell — so the question is never *whether* to authenticate,
 only *where* the check happens. This document covers the options and the
-research behind them; [SECURITY.md](SECURITY.md) covers the threat model.
+research behind them; [SECURITY.md](SECURITY.md) covers the threat model, and
+[IAP-OAUTH.md](IAP-OAUTH.md) is the step-by-step runbook for the hardest option
+(an identity-aware proxy with OAuth, which is what the Claude mobile app needs).
 
 ## Decide first: does anything need to reach it remotely?
 
@@ -69,6 +71,9 @@ For a remote instance, swap the URL for your public one and add whatever headers
 your proxy requires.
 
 ## Connecting the Claude app
+
+Full runbook with a worked Cloudflare Zero Trust example, the API calls, and the
+two traps that cost the most time: **[IAP-OAUTH.md](IAP-OAUTH.md)**. In outline:
 
 1. Put an authenticating tunnel or proxy in front of `127.0.0.1:7130` with an
    OAuth-capable identity layer, scoped to *you* — not "any authenticated user".

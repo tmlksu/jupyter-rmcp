@@ -12,9 +12,11 @@ machine, which a human can watch and edit in JupyterLab at the same time.
 - **Kaggle on a laptop:** `COLAB_ONLY=1` makes every kernel a Colab VM under
   your own Google account — nothing executes locally. See [docs/GUIDE.md](docs/GUIDE.md).
 - **Reference:** [DESIGN.md](DESIGN.md) (architecture, session management),
-  [docs/AUTH.md](docs/AUTH.md) (exposing it safely), [docs/SECURITY.md](docs/SECURITY.md)
-  (threat model), [docs/COLAB.md](docs/COLAB.md) (GPU offload),
-  [docs/adr/](docs/adr/) (why each choice was made).
+  [docs/AUTH.md](docs/AUTH.md) (exposing it safely) and
+  [docs/IAP-OAUTH.md](docs/IAP-OAUTH.md) (the runbook for reaching it from the
+  Claude mobile app), [docs/SECURITY.md](docs/SECURITY.md) (threat model),
+  [docs/COLAB.md](docs/COLAB.md) (GPU offload), [docs/adr/](docs/adr/) (why each
+  choice was made).
 
 ## What runs
 
@@ -55,6 +57,8 @@ reverse proxy or tunnel in front of port 7130 — plus an authenticating layer,
 because that URL executes code. [docs/AUTH.md](docs/AUTH.md) covers the options
 and the one real gotcha: an OAuth-based proxy sets its own `Authorization`
 header, which collides with `MCP_BEARER` and returns 401. Pick one, not both.
+[docs/IAP-OAUTH.md](docs/IAP-OAUTH.md) is the step-by-step setup, worked through
+on Cloudflare Zero Trust.
 
 ## Colab-only mode
 

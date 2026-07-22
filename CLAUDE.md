@@ -44,6 +44,7 @@ settled decision — most surprising choices here have a recorded reason.
 | Colleague walkthrough (Kaggle + Colab GPU) | `docs/GUIDE.md` |
 | Architecture, session management, reaper, write-back | `DESIGN.md` |
 | Exposing it safely, Claude connector auth | `docs/AUTH.md` |
+| IAP + OAuth setup runbook (Claude mobile app) | `docs/IAP-OAUTH.md` |
 | Threat model | `docs/SECURITY.md` |
 | Colab GPU offload internals | `docs/COLAB.md` |
 | Why a decision was made | `docs/adr/` |

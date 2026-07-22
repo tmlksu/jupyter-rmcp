@@ -17,6 +17,12 @@ First public release.
   no usable Colab credentials. See [ADR 0014](docs/adr/0014-colab-only-mode.md).
 - `docs/GUIDE.md` — end-to-end walkthrough for Kaggle competitions on a Colab
   GPU, including the VM lifecycle rules and troubleshooting.
+- `docs/IAP-OAUTH.md` — runbook for putting an identity-aware proxy with OAuth in
+  front of the server so the Claude mobile app can connect, worked through on
+  Cloudflare Zero Trust (tunnel, Access policies, Managed OAuth, service tokens)
+  with the verification steps and the two failure modes that waste the most
+  time: a `PUT` that silently drops your policies, and a service token attached
+  to an identity policy, where it is inert.
 - `MCP_UID` / `MCP_GID` for hosts whose account is not uid/gid 1000.
 - MIT `LICENSE`.
 
