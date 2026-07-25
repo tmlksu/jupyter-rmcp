@@ -15,6 +15,10 @@ machine, which a human can watch and edit in JupyterLab at the same time.
   (~475 MB of 1 GB used), published to the Claude app through a Cloudflare
   tunnel — [docs/deploy/gce-cloudflare.md](docs/deploy/gce-cloudflare.md),
   with the account prerequisites in [日本語](docs/ja/setup.md).
+- **Already have a host?** `python3 scripts/setup_cfzt.py` publishes it through
+  Cloudflare Zero Trust in five commands, building the access policy before the
+  hostname resolves — [docs/deploy/cloudflare-zero-trust.md](docs/deploy/cloudflare-zero-trust.md),
+  [日本語](docs/ja/cfzt.md).
 - **Reference:** [DESIGN.md](DESIGN.md) (architecture, session management),
   [docs/AUTH.md](docs/AUTH.md) (exposing it safely) and
   [docs/IAP-OAUTH.md](docs/IAP-OAUTH.md) (the runbook for reaching it from the
@@ -61,8 +65,20 @@ reverse proxy or tunnel in front of port 7130 — plus an authenticating layer,
 because that URL executes code. [docs/AUTH.md](docs/AUTH.md) covers the options
 and the one real gotcha: an OAuth-based proxy sets its own `Authorization`
 header, which collides with `MCP_BEARER` and returns 401. Pick one, not both.
-[docs/IAP-OAUTH.md](docs/IAP-OAUTH.md) is the step-by-step setup, worked through
-on Cloudflare Zero Trust.
+
+On Cloudflare Zero Trust that is scripted end to end:
+
+```bash
+python3 scripts/setup_cfzt.py init     # then fill in deploy.local/cfzt.env
+python3 scripts/setup_cfzt.py check    # validates the token, changes nothing
+python3 scripts/setup_cfzt.py apply    # Access policy + app + OAuth, THEN tunnel + DNS
+python3 scripts/setup_cfzt.py connector && python3 scripts/setup_cfzt.py verify
+```
+
+[docs/deploy/cloudflare-zero-trust.md](docs/deploy/cloudflare-zero-trust.md)
+([日本語](docs/ja/cfzt.md)) is the runbook around it;
+[docs/IAP-OAUTH.md](docs/IAP-OAUTH.md) is the same setup by hand, and the
+explanation of what each object is for.
 
 ## Colab-only mode
 
