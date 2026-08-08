@@ -42,7 +42,12 @@ async def _health(_request: Request) -> JSONResponse:
         backend = "ok"
     except Exception as e:  # noqa: BLE001
         backend = f"unreachable: {e}"
-    return JSONResponse({"status": "ok", "jupyter": backend, "colab_only": config.COLAB_ONLY})
+    # The execution-policy fields are reported so a checker can assert the DEPLOYED values
+    # (the smoke test times a slow execution against the real soft deadline, and a stale
+    # EXEC_TIMEOUT_SEC silently reintroduces the interrupt this server no longer wants).
+    return JSONResponse({"status": "ok", "jupyter": backend, "colab_only": config.COLAB_ONLY,
+                         "soft_reply_deadline_sec": config.SOFT_REPLY_DEADLINE_SEC,
+                         "exec_hard_timeout_sec": config.EXEC_TIMEOUT_SEC})
 
 
 app = mcp.http_app(path="/mcp", stateless_http=True, allowed_hosts=["*"], allowed_origins=["*"])

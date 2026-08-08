@@ -14,7 +14,9 @@ import uuid
 from typing import Any
 
 import backends
+import config
 import reaper
+import state
 from app import mcp
 from backends import local_jupyter
 from outputs import _format_outputs
@@ -272,7 +274,13 @@ async def execute_cell(kernel_id: str, index: int | None = None, cell_id: str | 
                        timeout: float | None = None) -> dict[str, Any]:
     """Run an EXISTING code cell in the kernel's bound notebook and update THAT cell's
     outputs in place (no duplicate). Target by `cell_id` (stable, preferred) OR `index`.
-    Editing (patch_cell/edit_cell) is separate — this only runs a cell as-is."""
+    Editing (patch_cell/edit_cell) is separate — this only runs a cell as-is.
+
+    IF THIS CALL APPEARS TO FAIL OR TIME OUT, the cell may still be running or may have
+    ALREADY completed. NEVER resend it as your first move — call get_execution(kernel_id)
+    to find out, and only re-run once you have CONFIRMED it never ran. Long cells come back
+    as status="still_running" with an exec_id rather than hanging, and a call arriving while
+    another execution holds this kernel returns status="busy" having run NOTHING."""
     reaper._ensure_background()
     path = await _require_notebook(kernel_id)
     nb = await _load_nb(path)
@@ -281,16 +289,28 @@ async def execute_cell(kernel_id: str, index: int | None = None, cell_id: str | 
     if cell.get("cell_type") != "code":
         raise RuntimeError(f"cell {i} is {cell.get('cell_type')}, not code")
     cid = cell.get("id")
-    reply = await backends._run_on_kernel(kernel_id, _norm_source(cell), timeout)
-    nb = await _load_nb(path)  # re-read to avoid clobbering concurrent edits; find by id
-    matches = [j for j, c in enumerate(nb["cells"]) if c.get("id") == cid]
-    if matches:
-        nb["cells"][matches[0]]["outputs"] = reply.get("outputs", [])
-        nb["cells"][matches[0]]["execution_count"] = reply.get("execution_count")
-        await local_jupyter._write_nb(path, nb)
-    res = backends._reply_result(reply)
-    res.update({"path": path, "id": cid, "rev": _rev(nb)})
-    return res
+    source = _norm_source(cell)
+
+    async def _run(sink: list[dict[str, Any]]) -> dict[str, Any]:
+        reply = await backends._run_on_kernel(kernel_id, source, timeout, sink)
+        nb = await _load_nb(path)  # re-read to avoid clobbering concurrent edits; find by id
+        matches = [j for j, c in enumerate(nb["cells"]) if c.get("id") == cid]
+        if matches:
+            nb["cells"][matches[0]]["outputs"] = reply.get("outputs", [])
+            nb["cells"][matches[0]]["execution_count"] = reply.get("execution_count")
+            await local_jupyter._write_nb(path, nb)
+        res = backends._reply_result(reply)
+        # `saved_to` is what the execution record carries, so a DETACHED execute_cell that
+        # is collected later still says where its outputs landed.
+        res.update({"path": path, "id": cid, "rev": _rev(nb),
+                    "saved_to": path if matches else None})
+        return res
+
+    # Two different cells can hold identical source; the cell being run is part of what
+    # makes this call the same call, so it belongs in the retry/replay key.
+    return await state.run_single_flight(
+        kernel_id, source, "execute_cell", _run, deadline=config.SOFT_REPLY_DEADLINE_SEC,
+        identity=f"execute_cell:{path}:{cid}:{source}")
 
 
 @mcp.tool

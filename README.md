@@ -127,15 +127,20 @@ server** regardless of where the compute is.
   env; on a Colab kernel call `setup_kaggle(kernel_id)` once — it injects the
   token into the VM without it ever appearing in execution history. Same idea
   for HuggingFace via `setup_hf`.
-- **Housekeeping:** `execute_code` enforces a per-call timeout
-  (`EXEC_TIMEOUT_SEC`); on timeout the kernel is interrupted and a
-  `status: "timeout"` result returned. Idle kernels are reaped after
+- **Long executions:** a foreground `execute_code` that outruns
+  `SOFT_REPLY_DEADLINE_SEC` (45 s) answers `status: "still_running"` with an
+  `exec_id` and the output so far — **the work is not killed**; collect it with
+  `get_execution(kernel_id, wait_seconds=20)`. One execution per kernel: a second
+  call meanwhile is refused (`status: "busy"`) rather than queued, so a client
+  timeout can't turn into the same code running twice. Nothing interrupts a
+  kernel unless you pass `timeout` (or set `EXEC_TIMEOUT_SEC` > 0).
+- **Housekeeping:** idle kernels are reaped after
   `KERNEL_IDLE_TIMEOUT_SEC` (`pin_kernel` to exempt), at most `MAX_KERNELS` at
   once, and nothing outlives `KERNEL_MAX_AGE_SEC`.
 
 ## MCP tools
 
-Kernels and execution: `start_kernel`, `execute_code`, `get_job`, `execute_cell`,
+Kernels and execution: `start_kernel`, `execute_code`, `get_execution`, `get_job`, `execute_cell`,
 `stop_kernel`, `restart_kernel`, `interrupt_kernel`, `pin_kernel`, `list_kernels`,
 `list_variables`, `list_backends`, `colab_log`, `setup_kaggle`, `setup_hf`.
 

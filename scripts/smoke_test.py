@@ -24,12 +24,12 @@ from fastmcp import Client
 
 # The EXACT MCP tool surface. Frozen during the refactor: update ONLY when a
 # docs/refactor/ phase spec says so (Phase 0 removed the two tunnel-backend
-# tools -> 31 names), in the same commit, together with
+# tools -> 31 names; ADR 0017 added get_execution -> 32), in the same commit, together with
 # tests/test_tool_surface.py. Do NOT weaken this to a subset check.
 EXPECTED_TOOLS = {
     "list_kernels", "start_kernel", "stop_kernel", "restart_kernel",
     "interrupt_kernel", "pin_kernel", "colab_log",
-    "execute_code", "get_job", "execute_cell", "list_variables",
+    "execute_code", "get_job", "get_execution", "execute_cell", "list_variables",
     "notebook_rev", "list_cells", "read_cells", "insert_cells", "insert_cell",
     "patch_cell", "edit_cell", "delete_cell", "move_cell",
     "list_backends", "setup_kaggle", "setup_hf",
@@ -101,6 +101,14 @@ async def _colab_only_checks(client: Client) -> None:
     check("list_files works", isinstance(r.data, list) and len(r.data) > 0, str(r.data))
 
 
+async def _soft_deadline(mcp_url: str) -> float:
+    """The server's ACTUAL reply deadline, so the timing check tests the deployment
+    rather than a constant this script happens to agree with."""
+    health = mcp_url.rsplit("/mcp", 1)[0] + "/health"
+    async with httpx.AsyncClient(timeout=10) as h:
+        return float((await h.get(health)).json().get("soft_reply_deadline_sec") or 45)
+
+
 async def _detect_colab_only(mcp_url: str) -> bool:
     """Ask /health which deployment mode the server runs in (the route predates the
     field, so a missing key means a normal local+colab server)."""
@@ -142,6 +150,65 @@ async def main() -> None:
             r = await client.call_tool("execute_code", {"kernel_id": kid, "code": "x + 1"})
             check("variable persists", "43" in r.data.get("text", ""), str(r.data))
 
+            # -- single-flight: a duplicate must be REFUSED, never queued (ADR 0017) --
+            # The regression this guards: a client gives up on a slow call, resends the
+            # same code, and the kernel runs it a second time. `_sf` counts real runs.
+            slow = "import time\n_sf = globals().get('_sf', 0) + 1\ntime.sleep(6)\nprint('sf', _sf)"
+            first = asyncio.ensure_future(
+                client.call_tool("execute_code", {"kernel_id": kid, "code": slow, "timeout": 60}))
+            await asyncio.sleep(2)
+            async with Client(url, auth=bearer or None) as retry_client:   # the "failed" call resent
+                r = await retry_client.call_tool("execute_code", {"kernel_id": kid, "code": slow})
+                check("duplicate execute refused", r.data.get("status") == "busy", str(r.data))
+                check("busy names it a retry", r.data.get("is_retry") is True, str(r.data))
+                check("busy reports elapsed",
+                      (r.data.get("running") or {}).get("elapsed_seconds", 0) > 0, str(r.data))
+
+                r = await retry_client.call_tool("get_execution", {"kernel_id": kid})
+                check("get_execution sees it running",
+                      r.data.get("status") == "running", str(r.data))
+            check("first execution completed", (await first).data.get("status") == "ok",
+                  str((await first).data))
+
+            r = await client.call_tool("get_execution", {"kernel_id": kid})
+            check("get_execution returns the result", "sf 1" in r.data.get("text", ""),
+                  str(r.data))
+
+            r = await client.call_tool("execute_code", {"kernel_id": kid, "code": "print('runs', _sf)"})
+            check("refused duplicate never ran", "runs 1" in r.data.get("text", ""), str(r.data))
+
+            # -- soft deadline: answer before the client gives up, never kill the work --
+            # Verified against the server's real SOFT_REPLY_DEADLINE_SEC, so this asserts
+            # the deployed value is actually short enough to beat a client timeout.
+            soft = await _soft_deadline(url)
+            slow2 = (f"import time, sys\nfor _i in range({int(soft) + 12}):\n"
+                     "    print('tick', _i, flush=True)\n    time.sleep(1)\nprint('SLOW_DONE')")
+            t0 = asyncio.get_running_loop().time()
+            r = await client.call_tool("execute_code", {"kernel_id": kid, "code": slow2})
+            elapsed = asyncio.get_running_loop().time() - t0
+            check("slow execution answers early", r.data.get("status") == "still_running", str(r.data))
+            check("answered within the deadline", elapsed < soft + 10, f"{elapsed:.1f}s > {soft}s")
+            exec_id = r.data.get("exec_id")
+            check("still_running carries an exec_id", bool(exec_id), str(r.data))
+            check("still_running shows live output", "tick" in r.data.get("partial_output", ""),
+                  str(r.data)[:300])
+
+            r = await client.call_tool("execute_code", {"kernel_id": kid, "code": "print('x')"})
+            check("detached execution still holds the kernel", r.data.get("status") == "busy",
+                  str(r.data))
+
+            for _ in range(6):   # long-poll until the detached work completes
+                r = await client.call_tool("get_execution",
+                                           {"kernel_id": kid, "exec_id": exec_id, "wait_seconds": 20})
+                if r.data.get("status") != "running":
+                    break
+            check("detached execution completes", r.data.get("status") == "ok", str(r.data)[:300])
+            check("detached output is collected", "SLOW_DONE" in r.data.get("text", ""),
+                  str(r.data)[:300])
+            check("detached execution wrote back", r.data.get("saved_to") == NB, str(r.data)[:300])
+            check("nothing was interrupted", "KeyboardInterrupt" not in r.data.get("text", ""),
+                  str(r.data)[:300])
+
             r = await client.call_tool("execute_code", {"kernel_id": kid, "code": "1/0"})
             check("error status", r.data.get("status") == "error", str(r.data))
             check("error names exception", "ZeroDivisionError" in r.data.get("text", ""),
@@ -152,6 +219,25 @@ async def main() -> None:
                                         "timeout": 2})
             check("timeout status", r.data.get("status") == "timeout", str(r.data))
             check("timed_out flag", r.data.get("timed_out") is True, str(r.data))
+
+            # -- a kernel restarted UNDER a detached execution must not wedge it --
+            # The execution's reply can never arrive after this (the library waits for an
+            # idle whose parent header the new kernel process will never send), so the
+            # liveness watchdog is the only thing that releases the single-flight claim.
+            # Without it every later call on this kernel returns "busy" forever.
+            r = await client.call_tool("execute_code",
+                                       {"kernel_id": kid, "code": "import time; time.sleep(600)"})
+            check("long sleep detaches", r.data.get("status") == "still_running", str(r.data))
+            r = await client.call_tool("restart_kernel", {"kernel_id": kid})
+            check("restart under a detached exec", r.data.get("status") == "restarted", str(r.data))
+            for _ in range(9):   # watchdog needs two consecutive non-busy observations
+                r = await client.call_tool("get_execution", {"kernel_id": kid, "wait_seconds": 20})
+                if r.data.get("status") != "running":
+                    break
+            check("wedged claim is released", r.data.get("status") != "running", str(r.data)[:300])
+            r = await client.call_tool("execute_code", {"kernel_id": kid, "code": "print('alive')"})
+            check("kernel is usable again", r.data.get("status") == "ok", str(r.data)[:300])
+            check("kernel really re-executes", "alive" in r.data.get("text", ""), str(r.data)[:200])
 
             r = await client.call_tool("list_kernels", {})
             mine = [k for k in r.data if k.get("kernel_id") == kid]

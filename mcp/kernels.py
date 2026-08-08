@@ -109,7 +109,12 @@ async def start_kernel(name: str = "python3", notebook_path: str | None = None,
       installs), keep reusing that kernel_id — do NOT stop_kernel (that destroys the VM)
       and do NOT call start_kernel again. Use restart_kernel to reset Python state while
       keeping the VM and its files/installed packages.
-    `gpu` — colab only: "T4"/"L4"/"A100"/"H100" (None = CPU). Local kernels capped by MAX_KERNELS."""
+    `gpu` — colab only: "T4"/"L4"/"A100"/"H100" (None = CPU). Local kernels capped by MAX_KERNELS.
+
+    IF THIS CALL APPEARS TO FAIL OR TIME OUT, a kernel may have started anyway (provisioning
+    a colab VM takes minutes, longer than most clients wait). Call `list_kernels` FIRST and
+    reuse what you find — calling start_kernel again leaks kernels, and on colab it burns a
+    second VM's worth of compute units."""
     reaper._ensure_background()
     if backend is None:
         backend = COLAB if config.COLAB_ONLY else LOCAL
@@ -206,7 +211,13 @@ async def restart_kernel(kernel_id: str) -> dict[str, str]:
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True})
 async def interrupt_kernel(kernel_id: str) -> dict[str, str]:
     """Interrupt a running kernel (raise KeyboardInterrupt) to stop a runaway execution.
-    LOCAL kernels only — Colab has no interrupt."""
+    LOCAL kernels only — Colab has no interrupt.
+
+    This is the ABORT for an execution you no longer want: one that get_execution reports as
+    still running, one holding the kernel so every new call returns status="busy", or a cell
+    stuck in a loop. It stops the code; the kernel and its variables survive (restart_kernel
+    clears those too). Prefer waiting via get_execution(wait_seconds=…) when the work is
+    simply slow — interrupting throws away whatever it had computed."""
     if backends.is_colab_kernel(kernel_id):
         return {"status": "unsupported", "kernel_id": kernel_id,
                 "detail": ("colab-cli has NO interrupt (no SIGINT-only stop). For a hung colab "
@@ -279,10 +290,24 @@ async def pin_kernel(kernel_id: str, pinned: bool = True) -> dict[str, Any]:
 
 @mcp.tool
 async def list_variables(kernel_id: str) -> Any:
-    """List the user-defined variables currently held in the kernel (name/type/size)."""
+    """List the user-defined variables currently held in the kernel (name/type/size).
+
+    Needs the kernel, so it cannot answer while a foreground execution holds it — it says
+    so rather than hanging. Collect that execution with get_execution first."""
     # Talks to the local kernel directly, so it bypasses backends._resolve_backend —
     # guard it here too (introspection still evaluates code in the kernel).
     backends._assert_exec_allowed(state._backend_of(kernel_id), kernel_id)
+    # Introspection runs code in the kernel, so it would queue behind a running execution
+    # and return nothing for as long as that one lasts — the no-reply failure ADR 0018
+    # exists to remove. Refuse fast and point at the tool that does answer.
+    blocked = state.running_exec(kernel_id)
+    if blocked is not None:
+        return {"kernel_id": kernel_id, "status": "kernel_busy", "running": blocked,
+                "note": (f"kernel '{kernel_id}' is busy with a foreground execution "
+                         f"({blocked['exec_id']}, running {blocked['elapsed_seconds']:.0f}s); "
+                         "listing variables needs the kernel, so it was refused rather than "
+                         f"left to hang. Collect it with get_execution('{kernel_id}', "
+                         "wait_seconds=20), then retry.")}
     kc = await local_jupyter._get_client(kernel_id)
     return await asyncio.to_thread(kc.list_variables)
 

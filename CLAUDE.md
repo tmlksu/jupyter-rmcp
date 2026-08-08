@@ -30,6 +30,11 @@ settled decision — most surprising choices here have a recorded reason.
 - **Execution routing is explicit.** An unknown `kernel_id` raises; it never
   falls back to the local backend. `backends._resolve_backend` is the single
   choke point — new execution paths go through it (ADR 0013).
+- **The server always answers before the client gives up, and never kills work to
+  do it.** One foreground execution per kernel (`state.run_single_flight`); a
+  second one is refused, not queued; past the soft deadline it detaches rather
+  than blocking or interrupting. Any new code path that runs user code goes
+  through that guard (ADR 0017, 0018).
 - **Secrets never in git.** `.env`, `secrets/`, `data/`, `deploy.local/` are
   git-ignored. Check `git diff --cached --name-only` before every commit.
 - **Nothing personal in the tracked tree.** Hostnames, domains, emails, absolute
@@ -56,7 +61,8 @@ settled decision — most surprising choices here have a recorded reason.
 
 Package layout under `mcp/`: `server.py` (entry point, `/health`, uvicorn),
 `app.py` (the FastMCP singleton + auth + instructions), `config.py` (every
-`os.environ` read), `state.py` (process-wide singletons), `registry.py`
+`os.environ` read), `state.py` (process-wide singletons + the single-flight
+execution guard, ADR 0017), `registry.py`
 (persistent kernel tracking), `reaper.py` (idle/max-age reaping + lazy startup),
 `backends/` (the `Backend` protocol, routing, and one module per backend), and
 the four tool modules `kernels.py`, `notebook.py`, `jobs.py`, `workspace.py`
@@ -71,6 +77,21 @@ the four tool modules `kernels.py`, `notebook.py`, `jobs.py`, `workspace.py`
   monkeypatched.
 - Match the surrounding conventions: loopback-only host binding, state
   bind-mounted under `./data`, no new host mounts without a reason.
+
+## Long-running execution protocol (applies to you too)
+
+The same rule the tool descriptions give the agent using this server applies when
+*you* drive a notebook from a session here — a call that does not come back has
+**not** failed:
+
+1. **Never resend code as your first response to an apparent failure.** Call
+   `get_execution(kernel_id)` and find out whether it is running or already done.
+2. **Poll, don't spin:** `get_execution(kernel_id, wait_seconds=20)` (or
+   `get_job(..., wait_seconds=20)` for a background job) waits server-side.
+3. **Resend only after confirming it never ran.** A blind resend is how one
+   `pip install` becomes two and a counter gets incremented twice.
+4. `status: "still_running"` and `status: "busy"` are normal, not errors.
+   `interrupt_kernel` is the abort; use it deliberately, not reflexively.
 
 ## Verify before you commit
 
