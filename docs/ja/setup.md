@@ -63,6 +63,11 @@ Colab をコマンドラインから動かすために、**あなたの Google �
 
 ## 準備 3 — Cloudflare
 
+Cloudflare Zero Trust を使ったことが無い場合は、**[cfzt.md](cfzt.md)** に
+「そもそも何をしているのか」から、設定スクリプトの使い方、詰まったときの対処まで
+まとめてあります(そちらは GCE に限らず、手元のマシンで動かす場合も同じ手順です)。
+以下はアカウント側の準備だけを抜き出したものです。
+
 1. https://dash.cloudflare.com でアカウント作成
 2. **ドメインを Cloudflare に追加**(既存ドメインのネームサーバーを Cloudflare に向けるか、
    Cloudflare Registrar で新規取得)

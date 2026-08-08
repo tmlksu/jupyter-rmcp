@@ -58,4 +58,6 @@ cat <<NEXT
   3) JupyterLab (watch/edit the same notebooks): http://127.0.0.1:$(grep '^JUPYTER_LAB_HOST_PORT=' .env | cut -d= -f2 || echo 7131)
   4) Colab GPU offload + Kaggle setup:           docs/GUIDE.md
   5) Reaching it from the Claude app / another machine: docs/AUTH.md
+     On Cloudflare Zero Trust this is scripted — python3 scripts/setup_cfzt.py init
+     (docs/deploy/cloudflare-zero-trust.md, 日本語: docs/ja/cfzt.md)
 NEXT

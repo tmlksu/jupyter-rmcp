@@ -23,3 +23,4 @@ New ADR: copy the shape of an existing one, next number, add a row below.
 | [0013](0013-refactor-drop-tunnel-persistent-registry.md) | Refactor: drop tunnel backend; persistent registry + backend split | Accepted |
 | [0014](0014-colab-only-mode.md) | COLAB_ONLY mode: a deployment that never executes code locally | Accepted |
 | [0015](0015-public-release.md) | Public release: one generalized repo, deployment specifics git-ignored | Accepted |
+| [0016](0016-scripted-cfzt-setup.md) | Scripted Cloudflare Zero Trust setup: build the gate before the door | Accepted |

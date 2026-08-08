@@ -72,8 +72,10 @@ your proxy requires.
 
 ## Connecting the Claude app
 
-Full runbook with a worked Cloudflare Zero Trust example, the API calls, and the
-two traps that cost the most time: **[IAP-OAUTH.md](IAP-OAUTH.md)**. In outline:
+On Cloudflare Zero Trust, this is scripted: `scripts/setup_cfzt.py`
+(**[deploy/cloudflare-zero-trust.md](deploy/cloudflare-zero-trust.md)**,
+[日本語](ja/cfzt.md)). Full runbook with the API calls done by hand, and the two
+traps that cost the most time: **[IAP-OAUTH.md](IAP-OAUTH.md)**. In outline:
 
 1. Put an authenticating tunnel or proxy in front of `127.0.0.1:7130` with an
    OAuth-capable identity layer, scoped to *you* — not "any authenticated user".

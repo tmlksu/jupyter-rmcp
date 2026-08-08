@@ -4,6 +4,34 @@ Notable, user-visible changes. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this file starts at the first
 public release — earlier history is the private development of the same code.
 
+## [Unreleased]
+
+### Added
+- **`scripts/setup_cfzt.py` — scripted Cloudflare Zero Trust publishing.**
+  Everything `docs/IAP-OAUTH.md` describes by hand (Access policy, application,
+  Managed OAuth, tunnel, ingress, DNS record, connector, optional service token),
+  done through the API by an idempotent stdlib-only script:
+  `init` → `check` → `apply` → `connector` → `verify`. It builds the **gate
+  before the door** — the Access policy and application exist before the DNS
+  record does, so the hostname never resolves to an unauthenticated
+  code-execution endpoint, which the dashboard's own ordering cannot avoid.
+  `check` names the exact Cloudflare permission any missing token scope
+  corresponds to, `apply` refuses to run while `MCP_BEARER` is set (the
+  `Authorization` collision that makes this deployment half-work), and `verify`
+  exits non-zero unless `/mcp` answers `401` **with** the `WWW-Authenticate`
+  challenge the Claude app needs. See
+  [ADR 0016](docs/adr/0016-scripted-cfzt-setup.md).
+- `docs/deploy/cloudflare-zero-trust.md` — the runbook around that script for a
+  host you already have, written to be executed by an agent with a human on hand
+  for the browser-only steps.
+- `docs/ja/cfzt.md` — a standalone Japanese guide that starts from what
+  Cloudflare Zero Trust *is* and why a tunnel plus an identity gate is the shape,
+  for colleagues who have never used it.
+- `tests/test_setup_cfzt.py` — pins the request shapes whose absence fails open
+  or fails silently: the full-body application `PUT` re-sending both policies and
+  `oauth_configuration`, the `non_identity` decision a service token needs, the
+  trailing catch-all ingress rule, and the DNS lookup filter.
+
 ## [1.0.0] — 2026-07-22
 
 First public release.
