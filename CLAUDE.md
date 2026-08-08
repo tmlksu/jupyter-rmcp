@@ -50,6 +50,8 @@ settled decision — most surprising choices here have a recorded reason.
 | Architecture, session management, reaper, write-back | `DESIGN.md` |
 | Exposing it safely, Claude connector auth | `docs/AUTH.md` |
 | IAP + OAuth setup runbook (Claude mobile app) | `docs/IAP-OAUTH.md` |
+| Scripted Cloudflare Zero Trust publish (a host you have) | `docs/deploy/cloudflare-zero-trust.md`, `scripts/setup_cfzt.py` |
+| The same, in Japanese, for someone new to Zero Trust | `docs/ja/cfzt.md` |
 | Deploying on a GCE free-tier VM (agent-executable) | `docs/deploy/gce-cloudflare.md` |
 | Account/API prerequisites, in Japanese | `docs/ja/setup.md` |
 | Threat model | `docs/SECURITY.md` |

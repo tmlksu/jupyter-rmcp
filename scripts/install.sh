@@ -22,7 +22,8 @@ MCP_HOST_PORT=7130
 JUPYTER_LAB_HOST_PORT=7131
 KERNEL_IDLE_TIMEOUT_SEC=3600
 KERNEL_MAX_AGE_SEC=28800
-EXEC_TIMEOUT_SEC=120
+EXEC_TIMEOUT_SEC=0
+SOFT_REPLY_DEADLINE_SEC=45
 MAX_KERNELS=8
 # Uncomment for a Colab-only instance (no local code execution). Needs GCLOUD_ADC.
 # COLAB_ONLY=1
@@ -58,4 +59,6 @@ cat <<NEXT
   3) JupyterLab (watch/edit the same notebooks): http://127.0.0.1:$(grep '^JUPYTER_LAB_HOST_PORT=' .env | cut -d= -f2 || echo 7131)
   4) Colab GPU offload + Kaggle setup:           docs/GUIDE.md
   5) Reaching it from the Claude app / another machine: docs/AUTH.md
+     On Cloudflare Zero Trust this is scripted — python3 scripts/setup_cfzt.py init
+     (docs/deploy/cloudflare-zero-trust.md, 日本語: docs/ja/cfzt.md)
 NEXT

@@ -198,6 +198,26 @@ docker compose logs mcp --tail 20        # no restart loop
 the credentials are wrong and the logs say which — a colab-only server refuses
 to start rather than failing one call at a time. Fix it here, not later.
 
+## Phases 4–6, the scripted way (preferred)
+
+`scripts/setup_cfzt.py` does all three phases through the Cloudflare API, in an
+order that has no open window at all — the Access policy exists before the DNS
+record does, so the paragraph above about "the dangerous window" stops applying:
+
+```bash
+python3 scripts/setup_cfzt.py init      # then fill in deploy.local/cfzt.env
+python3 scripts/setup_cfzt.py check
+python3 scripts/setup_cfzt.py apply     # policy + app + OAuth, then tunnel + DNS
+python3 scripts/setup_cfzt.py connector # installs cloudflared on the VM
+python3 scripts/setup_cfzt.py verify
+```
+
+Details, prerequisites and troubleshooting: [cloudflare-zero-trust.md](cloudflare-zero-trust.md)
+([日本語](../ja/cfzt.md)). Skip to phase 7 when `verify` passes. The three phases
+below are the same work by hand — keep them for when the API token cannot be
+given the permissions it needs, or when something has to be fixed one object at
+a time.
+
 ## Phase 4 — Tunnel
 
 **HUMAN:** a domain on your Cloudflare account, and Zero Trust enabled. Create

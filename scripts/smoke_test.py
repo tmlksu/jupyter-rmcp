@@ -24,7 +24,7 @@ from fastmcp import Client
 
 # The EXACT MCP tool surface. Frozen during the refactor: update ONLY when a
 # docs/refactor/ phase spec says so (Phase 0 removed the two tunnel-backend
-# tools -> 31 names), in the same commit, together with
+# tools -> 31 names; ADR 0017 added get_execution -> 32), in the same commit, together with
 # tests/test_tool_surface.py. Do NOT weaken this to a subset check.
 EXPECTED_TOOLS = {
     "list_kernels", "start_kernel", "stop_kernel", "restart_kernel",

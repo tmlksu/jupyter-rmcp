@@ -13,6 +13,14 @@ against, and because it requires writing zero OAuth code. Alternatives are
 discussed at the end. Cloudflare's UI and API change; treat exact field names as
 things to verify, not gospel.
 
+> **If you just want it working:** `scripts/setup_cfzt.py` performs everything
+> below through the API — and in a safer order, building the Access policy
+> before the hostname resolves rather than after
+> ([docs/deploy/cloudflare-zero-trust.md](deploy/cloudflare-zero-trust.md),
+> [日本語](ja/cfzt.md), [ADR 0016](adr/0016-scripted-cfzt-setup.md)). Read on
+> when you want to know what it is doing, when you are using a different
+> provider, or when it failed and you need to fix one object by hand.
+
 ## What you are building
 
 ```
