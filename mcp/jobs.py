@@ -135,8 +135,9 @@ async def execute_code(kernel_id: str, code: str, timeout: float | None = None,
     LONG WORK ANSWERS EARLY, IT IS NOT KILLED. If the execution outlives the server's reply
     deadline you get {status: "still_running", exec_id, partial_output} — the code keeps
     running on the kernel, nothing was interrupted, and get_execution collects the result
-    (and its notebook write-back) when it finishes. status="timeout" appears only when YOU
-    passed `timeout`, which is a hard cap that interrupts the kernel.
+    (and its notebook write-back) when it finishes. status="timeout" means something DID
+    interrupt the kernel: the `timeout` you passed, or a server-configured hard cap
+    (`/health` reports it as exec_hard_timeout_sec; 0 means none).
 
     ONE EXECUTION PER KERNEL: a call arriving while another is in flight returns
     status="busy" and executes NOTHING, rather than queueing your code to run a second time
@@ -165,8 +166,11 @@ async def execute_code(kernel_id: str, code: str, timeout: float | None = None,
     # The background LAUNCH is an exec too (it runs on the kernel), so it takes the same
     # slot — but only for the second or two it takes to spawn the detached process; the
     # job itself holds nothing, which is why long work belongs there.
-    return await state.run_single_flight(kernel_id, code, "execute_code", _run,
-                                         deadline=config.SOFT_REPLY_DEADLINE_SEC)
+    # Launching a background job and running the same code in the foreground are different
+    # requests, so they must not look like retries of each other.
+    return await state.run_single_flight(
+        kernel_id, code, "execute_code", _run, deadline=config.SOFT_REPLY_DEADLINE_SEC,
+        identity=f"execute_code:{'bg' if background else 'fg'}:{code}")
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
@@ -274,6 +278,19 @@ _JOB_POLL_INTERVAL_SEC = 5.0
 
 async def _poll_job(kernel_id: str, job_id: str, offset: int | None,
                     max_chars: int) -> dict[str, Any]:
+    # Reading a job's files is itself a kernel exec, so it would queue behind a foreground
+    # execution — silently, for as long as that one runs. Answering "I can't look right
+    # now, and here's why" beats the no-reply this whole design exists to eliminate.
+    blocked = state.running_exec(kernel_id)
+    if blocked is not None:
+        return {"kernel_id": kernel_id, "job_id": job_id, "status": "kernel_busy",
+                "output": "", "running": blocked,
+                "note": (f"could NOT read the job: kernel '{kernel_id}' is busy with a "
+                         f"foreground execution ({blocked['exec_id']}, running "
+                         f"{blocked['elapsed_seconds']:.0f}s), and reading job files needs the "
+                         "kernel. The JOB itself is unaffected — it runs in its own process. "
+                         "Collect the foreground execution first with "
+                         f"get_execution('{kernel_id}', wait_seconds=20), then poll again.")}
     off_lit = "None" if offset is None else str(int(offset))
     mx = max(256, int(max_chars))
     poll = (

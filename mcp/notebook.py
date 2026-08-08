@@ -300,11 +300,17 @@ async def execute_cell(kernel_id: str, index: int | None = None, cell_id: str | 
             nb["cells"][matches[0]]["execution_count"] = reply.get("execution_count")
             await local_jupyter._write_nb(path, nb)
         res = backends._reply_result(reply)
-        res.update({"path": path, "id": cid, "rev": _rev(nb)})
+        # `saved_to` is what the execution record carries, so a DETACHED execute_cell that
+        # is collected later still says where its outputs landed.
+        res.update({"path": path, "id": cid, "rev": _rev(nb),
+                    "saved_to": path if matches else None})
         return res
 
-    return await state.run_single_flight(kernel_id, source, "execute_cell", _run,
-                                         deadline=config.SOFT_REPLY_DEADLINE_SEC)
+    # Two different cells can hold identical source; the cell being run is part of what
+    # makes this call the same call, so it belongs in the retry/replay key.
+    return await state.run_single_flight(
+        kernel_id, source, "execute_cell", _run, deadline=config.SOFT_REPLY_DEADLINE_SEC,
+        identity=f"execute_cell:{path}:{cid}:{source}")
 
 
 @mcp.tool

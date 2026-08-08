@@ -42,6 +42,10 @@ public release — earlier history is the private development of the same code.
   answers *while* the kernel is busy — the moment it is actually needed. The
   local-kernel counterpart to `colab_log`. Tool surface: 31 → 32.
 - `get_job(..., wait_seconds=20)` long-polls a background job the same way.
+- `get_job` and `list_variables` now answer `status: "kernel_busy"` instead of queueing
+  invisibly behind a running execution — both need the kernel, and silently waiting
+  for it is the failure this release is about. The background job itself is
+  unaffected; it runs in its own process.
 - `/health` reports `soft_reply_deadline_sec` and `exec_hard_timeout_sec`, so a
   deployment's actual execution policy is checkable from outside.
 - Tool descriptions now spell out the protocol for a call that appears to fail —

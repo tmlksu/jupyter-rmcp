@@ -98,12 +98,22 @@ def running_exec(kernel_id: str) -> dict[str, Any] | None:
             "elapsed_seconds": round(time.monotonic() - info["started"], 1)}
 
 
+def _abort_hint(kernel_id: str) -> str:
+    """Name the abort that actually works on THIS kernel: colab has no interrupt, and
+    sending an agent to a tool that answers 'unsupported' just costs it another round."""
+    if backend_kind(_backend_of(kernel_id)) == "cli":
+        return ("restart_kernel (colab has no interrupt; restarting keeps the VM, its files "
+                "and installed packages, and only resets Python)")
+    return "interrupt_kernel"
+
+
 def _next_action(kernel_id: str) -> str:
     return (f"WAIT, then call get_execution('{kernel_id}', wait_seconds=20) to collect the "
             "result once it finishes (it never touches the kernel, so it answers even while one "
             "is busy; for a colab kernel colab_log also works). To ABORT the running execution "
-            "instead, call interrupt_kernel. For work that legitimately takes minutes, use "
-            "execute_code(background=True) + get_job, which returns immediately.")
+            f"instead, call {_abort_hint(kernel_id)}. Once this kernel is free again, long work "
+            "belongs in execute_code(background=True) + get_job, which returns immediately — but "
+            "that too has to wait for the current execution, so collect it first.")
 
 
 def _busy_result(kernel_id: str, code: str) -> dict[str, Any] | None:
@@ -163,6 +173,9 @@ def _record_exec(kernel_id: str, info: dict[str, Any], result: dict[str, Any]) -
         "execution_count": result.get("execution_count"),
         "text": text[-_LAST_TEXT_CHARS:], "text_truncated": len(text) > _LAST_TEXT_CHARS,
         "saved_to": result.get("saved_to"),
+        # A background LAUNCH is a foreground execution too, and its whole point is the
+        # handle it returns — dropping that would leave a detached launch uncollectable.
+        "job_id": result.get("job_id"),
         "duration_seconds": round(time.monotonic() - info["started"], 1),
         "started_at": info["started_at"], "finished_at": _now().isoformat(),
         "finished": time.monotonic(), "client_abandoned": abandoned,
@@ -219,9 +232,10 @@ def _still_running(kernel_id: str, info: dict[str, Any]) -> dict[str, Any]:
             "your client would not time out waiting. Poll "
             f"get_execution('{kernel_id}', wait_seconds=20) until it returns a final status; "
             "the full output and the notebook write-back land there when it finishes. "
-            "`partial_output` is what the kernel has printed so far (local kernels only). If "
-            "you expected this to be long, prefer execute_code(background=True) next time — "
-            "it returns immediately and streams via get_job."),
+            "`partial_output` is what the kernel has printed so far (local kernels only). To "
+            f"abort it instead, call {_abort_hint(kernel_id)}. If you expected this to be long, "
+            "prefer execute_code(background=True) next time — it returns immediately and "
+            "streams via get_job."),
     }
 
 
@@ -239,7 +253,8 @@ def _sink_text(sink: list) -> str:
 
 async def run_single_flight(kernel_id: str, code: str, tool: str,
                             runner: Callable[[list], Awaitable[dict[str, Any]]],
-                            deadline: float | None = None) -> dict[str, Any]:
+                            deadline: float | None = None,
+                            identity: str | None = None) -> dict[str, Any]:
     """Run `runner` as the kernel's one foreground execution, and ALWAYS answer in time.
 
     Four exits, and every one of them leaves the guard consistent:
@@ -254,16 +269,22 @@ async def run_single_flight(kernel_id: str, code: str, tool: str,
 
     The work is shielded in both detach cases, so nothing on the kernel is ever killed by
     this function; only a caller-supplied `timeout` interrupts a kernel.
+
+    `identity` is what "the same call" means for retry detection and replay — the code plus
+    whatever else distinguishes the operation (which cell, foreground vs background). It
+    defaults to the code alone; pass more whenever identical source could mean two
+    genuinely different requests.
     """
-    busy = _busy_result(kernel_id, code)
+    ident = identity if identity is not None else code
+    busy = _busy_result(kernel_id, ident)
     if busy is not None:
         return busy
-    replay = _take_replay(kernel_id, code)
+    replay = _take_replay(kernel_id, ident)
     if replay is not None:
         return replay
     info: dict[str, Any] = {
         "exec_id": "exec-" + uuid.uuid4().hex[:8], "tool": tool,
-        "code_sha": _code_sha(code), "code_head": code[:_CODE_HEAD_CHARS],
+        "code_sha": _code_sha(ident), "code_head": code[:_CODE_HEAD_CHARS],
         "started": time.monotonic(), "started_at": _now().isoformat(),
         "sink": [], "detached": False, "abandoned": False}
     _inflight[kernel_id] = info
@@ -277,6 +298,12 @@ async def run_single_flight(kernel_id: str, code: str, tool: str,
         return _still_running(kernel_id, info)
     except asyncio.CancelledError:
         info["abandoned"] = True
+        # The work may have finished in the same tick we were cancelled, in which case it
+        # was already recorded as "nobody abandoned this". Correct that: the caller still
+        # never saw it, which is exactly what licenses the one-shot replay.
+        rec = _last_exec.get(kernel_id)
+        if rec is not None and rec["exec_id"] == info["exec_id"]:
+            rec["client_abandoned"] = True
         log.info("%s on %s: caller went away; holding the kernel claim until it finishes",
                  tool, kernel_id)
         raise

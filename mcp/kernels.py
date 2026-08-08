@@ -290,10 +290,24 @@ async def pin_kernel(kernel_id: str, pinned: bool = True) -> dict[str, Any]:
 
 @mcp.tool
 async def list_variables(kernel_id: str) -> Any:
-    """List the user-defined variables currently held in the kernel (name/type/size)."""
+    """List the user-defined variables currently held in the kernel (name/type/size).
+
+    Needs the kernel, so it cannot answer while a foreground execution holds it — it says
+    so rather than hanging. Collect that execution with get_execution first."""
     # Talks to the local kernel directly, so it bypasses backends._resolve_backend —
     # guard it here too (introspection still evaluates code in the kernel).
     backends._assert_exec_allowed(state._backend_of(kernel_id), kernel_id)
+    # Introspection runs code in the kernel, so it would queue behind a running execution
+    # and return nothing for as long as that one lasts — the no-reply failure ADR 0018
+    # exists to remove. Refuse fast and point at the tool that does answer.
+    blocked = state.running_exec(kernel_id)
+    if blocked is not None:
+        return {"kernel_id": kernel_id, "status": "kernel_busy", "running": blocked,
+                "note": (f"kernel '{kernel_id}' is busy with a foreground execution "
+                         f"({blocked['exec_id']}, running {blocked['elapsed_seconds']:.0f}s); "
+                         "listing variables needs the kernel, so it was refused rather than "
+                         f"left to hang. Collect it with get_execution('{kernel_id}', "
+                         "wait_seconds=20), then retry.")}
     kc = await local_jupyter._get_client(kernel_id)
     return await asyncio.to_thread(kc.list_variables)
 

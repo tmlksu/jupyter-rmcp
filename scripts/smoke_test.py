@@ -220,6 +220,25 @@ async def main() -> None:
             check("timeout status", r.data.get("status") == "timeout", str(r.data))
             check("timed_out flag", r.data.get("timed_out") is True, str(r.data))
 
+            # -- a kernel restarted UNDER a detached execution must not wedge it --
+            # The execution's reply can never arrive after this (the library waits for an
+            # idle whose parent header the new kernel process will never send), so the
+            # liveness watchdog is the only thing that releases the single-flight claim.
+            # Without it every later call on this kernel returns "busy" forever.
+            r = await client.call_tool("execute_code",
+                                       {"kernel_id": kid, "code": "import time; time.sleep(600)"})
+            check("long sleep detaches", r.data.get("status") == "still_running", str(r.data))
+            r = await client.call_tool("restart_kernel", {"kernel_id": kid})
+            check("restart under a detached exec", r.data.get("status") == "restarted", str(r.data))
+            for _ in range(9):   # watchdog needs two consecutive non-busy observations
+                r = await client.call_tool("get_execution", {"kernel_id": kid, "wait_seconds": 20})
+                if r.data.get("status") != "running":
+                    break
+            check("wedged claim is released", r.data.get("status") != "running", str(r.data)[:300])
+            r = await client.call_tool("execute_code", {"kernel_id": kid, "code": "print('alive')"})
+            check("kernel is usable again", r.data.get("status") == "ok", str(r.data)[:300])
+            check("kernel really re-executes", "alive" in r.data.get("text", ""), str(r.data)[:200])
+
             r = await client.call_tool("list_kernels", {})
             mine = [k for k in r.data if k.get("kernel_id") == kid]
             check("list_kernels shows kernel", len(mine) == 1, str(r.data))

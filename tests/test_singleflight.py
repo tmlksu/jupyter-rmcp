@@ -15,6 +15,7 @@ import pytest
 
 import config
 import jobs
+import kernels
 import notebook
 import state
 
@@ -46,7 +47,7 @@ class _Kernel:
         self.calls: list[str] = []
         self.reply = reply or {"status": "ok", "execution_count": 1, "outputs": [], "timed_out": False}
 
-    async def run(self, _kernel_id, code, _timeout=None, sink=None):
+    async def run(self, _kernel_id, code, timeout=None, sink=None):
         self.calls.append(code)
         if sink is not None:
             sink.append({"output_type": "stream", "name": "stdout", "text": "progress...\n"})
@@ -465,3 +466,104 @@ def nb_stub(monkeypatch):
     monkeypatch.setattr(notebook.local_jupyter, "_read_nb", _read)
     monkeypatch.setattr(notebook.local_jupyter, "_write_nb", _write)
     return nb
+
+
+class TestReviewRegressions:
+    """Defects found by the adversarial review of ADR 0017/0018 — each one pinned."""
+
+    async def test_identical_source_in_two_cells_is_not_a_retry(self, monkeypatch,
+                                                                no_notebook, nb_stub):
+        """Two cells can hold the same source; running the second is not a resend."""
+        nb_stub["cells"].append({"cell_type": "code", "id": "c2", "source": "print('cell')\n",
+                                 "outputs": [], "execution_count": None})
+        k = _install(monkeypatch, _Kernel())
+        monkeypatch.setattr(notebook.backends, "_run_on_kernel", k.run)
+        k.gate.set()
+        await notebook.execute_cell("kid-cells", cell_id="c1")
+
+        await notebook.execute_cell("kid-cells", cell_id="c2")
+
+        assert len(k.calls) == 2      # the second cell really ran
+
+    async def test_background_launch_is_not_a_retry_of_the_foreground_run(self, monkeypatch,
+                                                                          no_notebook):
+        k = _install(monkeypatch, _Kernel())
+        k.gate.set()
+        await jobs.execute_code("kid-bg", CODE)
+
+        await jobs.execute_code("kid-bg", CODE, background=True)
+
+        assert len(k.calls) == 2      # the launch is a different request, not a replay
+
+    async def test_background_launch_keeps_its_job_id_in_the_record(self, monkeypatch,
+                                                                    no_notebook):
+        k = _install(monkeypatch, _Kernel())
+        k.gate.set()
+        started = await jobs.execute_code("kid-bgj", CODE, background=True)
+
+        r = await jobs.get_execution("kid-bgj")
+
+        assert r["job_id"] == started["job_id"]   # the handle survives detachment
+
+    async def test_detached_execute_cell_records_where_it_was_written(self, monkeypatch,
+                                                                      no_notebook, nb_stub):
+        monkeypatch.setattr(config, "SOFT_REPLY_DEADLINE_SEC", 0.05)
+        k = _install(monkeypatch, _Kernel())
+        monkeypatch.setattr(notebook.backends, "_run_on_kernel", k.run)
+        r = await notebook.execute_cell("kid-cellsave", cell_id="c1")
+        assert r["status"] == "still_running"
+        k.gate.set()
+
+        rec = await jobs.get_execution("kid-cellsave", wait_seconds=5)
+
+        assert rec["saved_to"] == "work.ipynb"
+
+    async def test_get_job_refuses_instead_of_blocking_on_a_busy_kernel(self, monkeypatch,
+                                                                        no_notebook):
+        k = _install(monkeypatch, _Kernel())
+        first = asyncio.ensure_future(jobs.execute_code("kid-jb", CODE))
+        await k.started.wait()
+
+        r = await jobs.get_job("kid-jb", "job-1")
+
+        assert r["status"] == "kernel_busy"
+        assert "get_execution" in r["note"]
+        assert k.calls == [CODE]      # the poll never reached the kernel
+        k.gate.set()
+        await first
+
+    async def test_list_variables_refuses_instead_of_blocking(self, monkeypatch, no_notebook):
+        k = _install(monkeypatch, _Kernel())
+        first = asyncio.ensure_future(jobs.execute_code("kid-lv", CODE))
+        await k.started.wait()
+
+        r = await kernels.list_variables("kid-lv")
+
+        assert r["status"] == "kernel_busy"
+        k.gate.set()
+        await first
+
+    async def test_cancel_racing_completion_still_marks_it_abandoned(self, monkeypatch,
+                                                                     no_notebook):
+        """The work finished in the same tick the caller was cancelled — it still never
+        saw the result, so its retry must replay rather than re-run."""
+        k = _install(monkeypatch, _Kernel())
+        k.gate.set()
+        first = asyncio.ensure_future(jobs.execute_code("kid-race", CODE))
+        await asyncio.sleep(0)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        await asyncio.sleep(0.01)
+
+        assert state._last_exec["kid-race"]["client_abandoned"] is True
+
+    def test_streaming_fallback_is_chosen_before_anything_runs(self):
+        """An AttributeError raised mid-execution must never retry the cell."""
+        import inspect
+
+        from backends import local_jupyter
+        src = inspect.getsource(local_jupyter._execute_streaming)
+        body = src.split('"""')[-1]
+        assert "except AttributeError" not in body
+        assert body.index("kc.execute(") < body.index("execute_interactive(")

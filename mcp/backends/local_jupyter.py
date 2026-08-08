@@ -232,21 +232,74 @@ def _execute_streaming(kc: KernelClient, code: str, sink: list[dict[str, Any]],
     The library builds its output list in a local and only hands it back at the end, so a
     long execution looks silent until it finishes — exactly when we most need to show that
     it is alive (the `still_running` reply, ADR 0018). `execute_interactive`'s output_hook
-    is the supported seam for this; reaching it means going through the manager's client,
-    so an upstream reshuffle falls back to the plain call rather than breaking execution."""
-    try:
-        client = kc._manager.client
-        reply = client.execute_interactive(
-            code, allow_stdin=False, stop_on_error=True, timeout=timeout,
-            output_hook=partial(_output_hook, sink))
-    except AttributeError:  # pragma: no cover - upstream shape changed
+    is the supported seam for this; reaching it means going through the manager's client, so
+    an upstream reshuffle falls back to the plain call rather than breaking execution.
+
+    The fallback is chosen BEFORE anything is sent to the kernel. Wrapping the execution
+    itself in the `except` would mean an AttributeError raised mid-run — from the output
+    hook, say — retried the whole cell on a kernel that had already run it."""
+    client = getattr(getattr(kc, "_manager", None), "client", None)
+    if client is None or not hasattr(client, "execute_interactive"):  # pragma: no cover
         log.warning("live output capture unavailable; falling back to buffered execute")
         return kc.execute(code, timeout=timeout)
+    reply = client.execute_interactive(
+        code, allow_stdin=False, stop_on_error=True, timeout=timeout,
+        output_hook=partial(_output_hook, sink))
     content = reply["content"]
     for output in sink:
         output.pop("transient", None)
     return {"execution_count": content.get("execution_count"), "outputs": list(sink),
             "status": content["status"]}
+
+
+# An execution with no hard cap must still hand the library a FINITE deadline: past its
+# own timeout `execute_interactive` degrades into a zero-second wait loop that spins a
+# core, so a small value would burn CPU for the rest of a long run. A month is finite
+# enough to let an orphaned worker thread eventually unwind and long enough that no real
+# execution ever reaches it — the liveness watchdog below is what actually bounds us.
+_LIB_DEADLINE_SEC = 30 * 24 * 3600
+_LIVENESS_INTERVAL_SEC = 30.0
+
+
+async def _kernel_is_running(kernel_id: str, backend: str) -> bool:
+    """Is this kernel still executing something? Errors count as 'yes' — a transient
+    Jupyter hiccup must never be read as 'your execution died'."""
+    try:
+        return any(k.get("id") == kernel_id and k.get("execution_state") == "busy"
+                   for k in await _kernels(backend))
+    except Exception as e:  # noqa: BLE001
+        log.warning("liveness check failed for %s: %s", kernel_id, e)
+        return True
+
+
+async def _await_uncapped(task: asyncio.Future, kernel_id: str, backend: str) -> dict[str, Any]:
+    """Wait for an execution with no hard cap — but notice if the kernel stops running it.
+
+    `execute_interactive` returns only on an iopub `idle` whose parent matches ITS request.
+    A kernel restarted in place (the JupyterLab button a co-editing human has, or Jupyter's
+    own restart after an OOM kill) keeps the websocket open and never emits that message,
+    so the call would wait forever: the single-flight claim would never be released and the
+    kernel would answer `busy` for the life of the process. Two consecutive non-busy
+    observations mean our execution is gone, whatever the library still believes.
+
+    Never cancels the task — a watchdog that killed the work would defeat the whole point."""
+    misses = 0
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=_LIVENESS_INTERVAL_SEC)
+        if done:
+            return task.result()
+        if await _kernel_is_running(kernel_id, backend):
+            misses = 0
+            continue
+        misses += 1
+        if misses >= 2:
+            await _drop_client(kernel_id)   # let the orphaned worker unwind
+            raise RuntimeError(
+                f"kernel '{kernel_id}' stopped running this execution before it finished — it "
+                "was restarted or died underneath it (a manual restart in JupyterLab, or the "
+                "kernel process being killed). NOTHING further will arrive for this call and "
+                "its result is unrecoverable. The kernel itself is usable again; re-run the "
+                "code if you still need it.")
 
 
 # ---- local execution (the jupyter branch of the old _run_on_kernel) ---------
@@ -273,24 +326,36 @@ async def exec_local(kernel_id: str, backend: str, code: str, timeout: float | N
         # The worker thread can't be cancelled, so shield it, interrupt on timeout,
         # then wait a grace for it to unwind — holding the per-kernel lock throughout.
         task = asyncio.ensure_future(
-            asyncio.to_thread(_execute_streaming, kc, code, sink, (to or 0) + 3600))
+            asyncio.to_thread(_execute_streaming, kc, code, sink, (to or 0) + _LIB_DEADLINE_SEC))
         try:
-            # No hard cap (`to` == 0): wait for the work itself. Detaching
-            # (state.run_single_flight) is what keeps the CALLER responsive; nothing here
-            # kills the execution, so a long job is never truncated by a default.
+            # No hard cap (`to` == 0): wait for the work itself, watching the kernel rather
+            # than a clock. Detaching (state.run_single_flight) is what keeps the CALLER
+            # responsive; nothing here kills the execution, so a long job is never truncated.
             reply = (await asyncio.wait_for(asyncio.shield(task), timeout=to) if to
-                     else await asyncio.shield(task))
+                     else await _await_uncapped(task, kernel_id, backend))
         except TimeoutError:
             log.info("execute exceeded %.0fs on %s; interrupting", to, kernel_id)
             try:
                 await _rest_post(f"/api/kernels/{kernel_id}/interrupt", backend=backend)
                 reply = await asyncio.wait_for(asyncio.shield(task), timeout=15)
             except TimeoutError:
-                await _drop_client(kernel_id)
-                return {"status": "timeout", "execution_count": None, "outputs": [], "timed_out": True,
-                        "note": ("interrupt did not unwind within the grace period — the kernel may "
-                                 "still be busy. Captured output could not be recovered here; verify "
-                                 "via a result the cell persists, or restart_kernel to abort.")}
+                # The interrupt did not land. Do NOT return yet: the kernel is still running
+                # our code, and returning would release the single-flight claim (ADR 0017)
+                # while it does — handing a retry an idle-looking kernel. Wait for the kernel
+                # itself to say it is done, with the same watchdog that bounds the uncapped
+                # path. Whatever the sink captured before the cutoff is still ours to report.
+                log.info("interrupt did not unwind on %s; waiting for the kernel to go idle",
+                         kernel_id)
+                try:
+                    reply = await _await_uncapped(task, kernel_id, backend)
+                except RuntimeError:
+                    await _drop_client(kernel_id)
+                    return {"status": "timeout", "execution_count": None,
+                            "outputs": list(sink), "timed_out": True,
+                            "note": ("the interrupt did not unwind and the kernel then stopped "
+                                     "running this code (restarted or killed). Any output "
+                                     "captured before the cutoff is included; re-run if you "
+                                     "still need the result.")}
             reply["timed_out"] = True
             return reply
         except Exception as e:  # noqa: BLE001

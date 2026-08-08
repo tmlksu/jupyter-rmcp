@@ -262,13 +262,20 @@ async def _heartbeat_colab(kid: str, now) -> None:
 # =============================================================================
 # colab execution (the cli branch of the old _run_on_kernel; colab-only, no dispatch)
 # =============================================================================
+_COLAB_UNCAPPED_SEC = 86400.0   # colab-cli requires a --timeout; this stands in for "none"
+
+
 async def exec_colab(kernel_id: str, code: str, timeout: float | None = None) -> dict[str, Any]:
     """Execute code on a colab session via colab-cli; return a normalized reply
     {status, execution_count, outputs(nbformat), timed_out}. Serializes on the per-session
     lock (colab-cli ops share one sessions.json; concurrent invocations can corrupt it)."""
     lock = state._locks.setdefault(kernel_id, asyncio.Lock())
     async with lock:
-        cto = float(timeout) if timeout else max(EXEC_TIMEOUT_SEC, 180.0)
+        # Same policy as the local backend (ADR 0018): only an EXPLICIT cap interrupts.
+        # This used to floor at 180s, which — now that EXEC_TIMEOUT_SEC defaults to 0 —
+        # would have left colab, the GPU backend, as the one place a long job still died
+        # at a hidden default. colab-cli needs *some* number, so an uncapped run gets a day.
+        cto = float(timeout) if timeout else (EXEC_TIMEOUT_SEC or _COLAB_UNCAPPED_SEC)
         # Give colab exec its OWN kernel-side --timeout (default is only 30s) so it
         # returns partial output cleanly at the same deadline we intend; our subprocess
         # kill in _colab_cli is just a backstop a grace period later.

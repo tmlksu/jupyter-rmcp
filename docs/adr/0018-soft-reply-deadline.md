@@ -47,17 +47,34 @@ waits* and *how long the work may live*. They have nothing to do with each other
    hands them back only at the end, which makes a long execution look dead exactly when
    the agent most needs evidence that it isn't. The execution now writes each output
    into a per-execution sink as it arrives, via `execute_interactive`'s `output_hook`.
-   That seam lives one level below the public `execute()`, so the call is wrapped with
-   a fallback to the buffered path — degraded progress reporting is acceptable, a
-   broken execution path is not.
-5. **The bookkeeping happens inside the task, not in a done-callback.** Release and
+   That seam lives one level below the public `execute()`, so there is a fallback to the
+   buffered path — degraded progress reporting is acceptable, a broken execution path is
+   not. The fallback is *chosen before anything is sent to the kernel*: wrapping the
+   execution itself would let an error raised mid-run re-send a cell the kernel had
+   already executed, which is the very bug ADR 0017 exists to prevent.
+5. **An uncapped wait is bounded by the KERNEL, not by a clock.** Removing the hard cap
+   removed the only thing that ever ended a wait, and `execute_interactive` returns only
+   on an iopub `idle` whose parent matches its own request. A kernel restarted in place —
+   the JupyterLab button a co-editing human has (ADR 0012), or Jupyter's own restart after
+   an OOM kill — keeps the websocket open and never sends that message, so the call waited
+   forever: the single-flight claim was never released and the kernel answered `busy` for
+   the life of the process. `_await_uncapped` therefore polls the kernel's
+   `execution_state` every 30 s and gives up after two consecutive non-busy observations
+   (a failed poll counts as *busy*, so a Jupyter hiccup is never read as "your execution
+   died"). It never cancels the task — a watchdog that killed the work would defeat the
+   point. The same wait is reused when an interrupt fails to unwind, so that path stops
+   releasing the claim while the kernel is demonstrably still running the code.
+   The deadline handed to the library is large but finite (30 days): past its own timeout
+   `execute_interactive` degrades into a zero-second wait loop that spins a core, and an
+   infinite one would strand an orphaned worker thread forever.
+6. **The bookkeeping happens inside the task, not in a done-callback.** Release and
    record run within the wrapped coroutine, so any observer that sees `task.done()` can
    trust that the claim is gone and the result is recorded. A callback fires a tick
    later, which a long poll would race.
-6. **`still_running` is not `client_abandoned`.** A detached execution answered its
+7. **`still_running` is not `client_abandoned`.** A detached execution answered its
    caller and handed over an exec_id, so it is not eligible for ADR 0017's one-shot
    replay; only a truly abandoned (cancelled) call is. The two are tracked separately.
-7. **`get_job` gains the same `wait_seconds`** long poll, on a 5 s interval — each poll
+8. **`get_job` gains the same `wait_seconds`** long poll, on a 5 s interval — each poll
    is a real kernel exec, so a tight loop would both waste the kernel and queue behind
    a foreground execution.
 
@@ -75,6 +92,14 @@ waits* and *how long the work may live*. They have nothing to do with each other
 - A detached execution holds its kernel for as long as it runs, so every other call on
   that kernel gets `busy`. That is the intended reading: the kernel really is occupied.
   Work that should not occupy it belongs in `execute_code(background=True)`.
+- The tools that need the kernel but are *not* executions — `get_job` (it reads the job's
+  files through a kernel exec) and `list_variables` — used to queue silently behind a
+  detached execution for as long as it ran, reproducing the no-reply failure this ADR
+  exists to remove. They now refuse fast with `status: "kernel_busy"` and point at
+  `get_execution`. The background job itself is unaffected: it runs in its own process.
+- Retry identity is the code *plus what makes the request that request* — which cell, and
+  foreground versus background launch. Two cells holding identical source are two
+  different runs, not a resend.
 - `partial_output` is local-backend only. colab-cli returns its output in one piece at
   the end, so the sink stays empty there and the note says so rather than implying the
   execution is silent.
