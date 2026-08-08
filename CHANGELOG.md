@@ -4,6 +4,34 @@ Notable, user-visible changes. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this file starts at the first
 public release — earlier history is the private development of the same code.
 
+## [Unreleased]
+
+### Fixed
+- **A long execution no longer runs twice when the client gives up on it.** MCP
+  clients abandon a tool call that doesn't answer in time, the agent reads that
+  as a failure and resends the code, and a Jupyter kernel — which *queues* shell
+  messages — dutifully ran it a second time: doubled variable updates, doubled
+  file writes, a `pip install` racing itself. `execute_code` and `execute_cell`
+  now hold a per-kernel execution slot; a second call while one is in flight
+  returns `status: "busy"` and executes **nothing**, telling the agent how long
+  the first has been running and, when the code matches, that this is its own
+  retry. A caller that cancels does not release the slot (the work is still
+  running), and if its identical retry arrives after the work finished, the
+  recorded result is replayed once instead of re-executed. See
+  [ADR 0017](docs/adr/0017-single-flight-execution.md).
+
+### Added
+- **`get_last_execution(kernel_id)` — what happened to the call that never came
+  back.** Reports the execution running right now, or the last completed one
+  (status, code head, output, timing), flagging the ones whose caller had already
+  stopped listening. It reads in-process state with no kernel round-trip, so it
+  answers *while* the kernel is busy — the moment it is actually needed. The
+  local-kernel counterpart to `colab_log`. Tool surface: 31 → 32.
+- `tests/test_singleflight.py` — pins the behavior that silently breaks: the
+  second call executing nothing, the claim being released down every exit path
+  (ok / error / timeout / session_lost / cancelled caller), and a cancelled
+  caller's retry still being refused.
+
 ## [1.0.0] — 2026-07-22
 
 First public release.

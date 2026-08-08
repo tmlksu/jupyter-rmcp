@@ -17,7 +17,7 @@ EXPECTED_TOOLS = {
     "list_kernels", "start_kernel", "stop_kernel", "restart_kernel",
     "interrupt_kernel", "pin_kernel", "colab_log",
     # execution
-    "execute_code", "get_job", "execute_cell", "list_variables",
+    "execute_code", "get_job", "get_last_execution", "execute_cell", "list_variables",
     # notebook editing (ADR 0011)
     "notebook_rev", "list_cells", "read_cells", "insert_cells", "insert_cell",
     "patch_cell", "edit_cell", "delete_cell", "move_cell",
@@ -43,4 +43,4 @@ async def test_tool_names_exact():
 
 
 async def test_tool_count():
-    assert len(EXPECTED_TOOLS) == 31  # Phase 0 removed the two tunnel-backend tools
+    assert len(EXPECTED_TOOLS) == 32  # +get_last_execution (ADR 0017); Phase 0 dropped the two tunnel tools

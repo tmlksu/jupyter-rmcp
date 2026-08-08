@@ -196,6 +196,8 @@ def _forget_colab(kernel_id: str) -> None:
     state._registry.forget(kernel_id)
     state._locks.pop(kernel_id, None)
     state._clients.pop(kernel_id, None)
+    # NOT state.forget_exec(): this runs from inside a failing exec (_mark_lost), whose own
+    # release is still pending, and the recorded session_lost result stays worth reading.
 
 
 async def _confirm_lost(kernel_id: str) -> bool:

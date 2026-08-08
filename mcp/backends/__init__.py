@@ -125,6 +125,7 @@ async def _delete_kernel(kernel_id: str, backend: str | None = None) -> None:
         if r.status_code not in (204, 404):
             r.raise_for_status()
     state._registry.forget(kernel_id)
+    state.forget_exec(kernel_id)   # a dead kernel has no in-flight and no result worth keeping
 
 
 # ---- reaping dispatch -------------------------------------------------------

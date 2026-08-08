@@ -24,6 +24,7 @@ from typing import Any
 
 import backends
 import reaper
+import state
 from app import mcp
 from backends import local_jupyter
 from config import log
@@ -56,6 +57,54 @@ def _job_launch_code(job_id: str, user_code: str) -> str:
     )
 
 
+async def _write_back(kernel_id: str, code: str, reply: dict[str, Any],
+                      result: dict[str, Any]) -> None:
+    """Append the executed cell to the kernel's bound notebook, if it has one."""
+    nb_path = await local_jupyter._notebook_for_kernel(kernel_id)
+    if not nb_path:
+        return
+    try:
+        await local_jupyter._append_cell(nb_path, code, reply)
+        result["saved_to"] = nb_path
+    except Exception as e:  # noqa: BLE001
+        log.warning("notebook write-back failed for %s: %s", nb_path, e)
+
+
+async def _execute_background(kernel_id: str, code: str) -> dict[str, Any]:
+    job_id = "job-" + uuid.uuid4().hex[:8]
+    reply = await backends._run_on_kernel(kernel_id, _job_launch_code(job_id, code), timeout=60)
+    result = backends._reply_result(reply)
+    # Only claim the job started if the LAUNCH exec actually succeeded. Otherwise (session
+    # lost, error, timeout) surface that — never hand back a running_in_background/job_id for
+    # a job that was never spawned (that produced the "get_job stuck at unknown forever" bug).
+    if result.get("status") != "ok":
+        result["note"] = (
+            "background job did NOT start — the launch command failed (status/output above; "
+            "the colab session may be lost/expired). NO job is running and no job_id is valid. "
+            "Start a fresh session with start_kernel and retry.")
+        return result
+    result.update({"status": "running_in_background", "job_id": job_id,
+                   "note": (f"Job {job_id} started detached (its own process) — the work is "
+                            "NOT bounded by any timeout. Poll get_job(kernel_id, job_id) until "
+                            "status != 'running_in_background' (it returns the latest output "
+                            "window + next_offset; pass next_offset back to stream only what's "
+                            "new). It does NOT share the kernel namespace — persist results to a "
+                            "file and read/download them. Plain Python only (no !shell/%magic; "
+                            "use subprocess).")})
+    await _write_back(kernel_id, code, reply, result)
+    return result
+
+
+async def _execute_foreground(kernel_id: str, code: str, timeout: float | None) -> dict[str, Any]:
+    reply = await backends._run_on_kernel(kernel_id, code, timeout)
+    result = backends._reply_result(reply)
+    # A lost session ran nothing — skip write-back (there is no cell to append, and probing
+    # _notebook_for_kernel would re-create a bare registry entry for the just-forgotten id).
+    if result.get("status") != "session_lost":
+        await _write_back(kernel_id, code, reply, result)
+    return result
+
+
 @mcp.tool
 async def execute_code(kernel_id: str, code: str, timeout: float | None = None,
                        background: bool = False) -> dict[str, Any]:
@@ -72,6 +121,11 @@ async def execute_code(kernel_id: str, code: str, timeout: float | None = None,
     compute or large output can make the reply lag the visible stdout). Any output captured
     before the cutoff is returned, and a `note` explains next steps.
 
+    NEVER RESEND A CALL THAT SEEMED TO FAIL. One kernel runs ONE execution at a time. If a
+    call is still in flight, this returns status="busy" and executes NOTHING (rather than
+    queueing your code to run a second time behind the first); collect the first call's
+    result with get_last_execution(kernel_id) instead of re-running it.
+
     `background=True` — for LONG jobs (model download, training): the code runs as a detached
     OS process on the kernel host/VM and this returns IMMEDIATELY with {status:
     "running_in_background", job_id}. No timeout on the actual work. Poll get_job(kernel_id,
@@ -86,48 +140,66 @@ async def execute_code(kernel_id: str, code: str, timeout: float | None = None,
     checkpoint). To CONTINUE interactive state instead, run foreground in bounded chunks (e.g.
     1000 iters/call) that checkpoint to disk, rather than one giant background job."""
     reaper._ensure_background()
-    if background:
-        job_id = "job-" + uuid.uuid4().hex[:8]
-        reply = await backends._run_on_kernel(kernel_id, _job_launch_code(job_id, code), timeout=60)
-        result = backends._reply_result(reply)
-        # Only claim the job started if the LAUNCH exec actually succeeded. Otherwise (session
-        # lost, error, timeout) surface that — never hand back a running_in_background/job_id for
-        # a job that was never spawned (that produced the "get_job stuck at unknown forever" bug).
-        if result.get("status") != "ok":
-            result["note"] = (
-                "background job did NOT start — the launch command failed (status/output above; "
-                "the colab session may be lost/expired). NO job is running and no job_id is valid. "
-                "Start a fresh session with start_kernel and retry.")
-            return result
-        result.update({"status": "running_in_background", "job_id": job_id,
-                       "note": (f"Job {job_id} started detached (its own process) — the work is "
-                                "NOT bounded by any timeout. Poll get_job(kernel_id, job_id) until "
-                                "status != 'running_in_background' (it returns the latest output "
-                                "window + next_offset; pass next_offset back to stream only what's "
-                                "new). It does NOT share the kernel namespace — persist results to a "
-                                "file and read/download them. Plain Python only (no !shell/%magic; "
-                                "use subprocess).")})
-        nb_path = await local_jupyter._notebook_for_kernel(kernel_id)
-        if nb_path:
-            try:
-                await local_jupyter._append_cell(nb_path, code, reply)
-                result["saved_to"] = nb_path
-            except Exception as e:  # noqa: BLE001
-                log.warning("notebook write-back failed for %s: %s", nb_path, e)
-        return result
-    reply = await backends._run_on_kernel(kernel_id, code, timeout)
-    result = backends._reply_result(reply)
-    # A lost session ran nothing — skip write-back (there is no cell to append, and probing
-    # _notebook_for_kernel would re-create a bare registry entry for the just-forgotten id).
-    if result.get("status") != "session_lost":
-        nb_path = await local_jupyter._notebook_for_kernel(kernel_id)
-        if nb_path:
-            try:
-                await local_jupyter._append_cell(nb_path, code, reply)
-                result["saved_to"] = nb_path
-            except Exception as e:  # noqa: BLE001
-                log.warning("notebook write-back failed for %s: %s", nb_path, e)
-    return result
+
+    async def _run() -> dict[str, Any]:
+        if background:
+            return await _execute_background(kernel_id, code)
+        return await _execute_foreground(kernel_id, code, timeout)
+
+    # The background LAUNCH is an exec too (it runs on the kernel), so it takes the same
+    # slot — but only for the second or two it takes to spawn the detached process; the
+    # job itself holds nothing, which is why long work belongs there.
+    return await state.run_single_flight(kernel_id, code, "execute_code", _run)
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def get_last_execution(kernel_id: str, max_chars: int = 4000) -> dict[str, Any]:
+    """What is (or was) running on this kernel — the answer to a call that never came back.
+
+    Use this INSTEAD of re-running code whenever an execute_code/execute_cell call appeared
+    to fail, timed out client-side, or came back status="busy". It reads in-process
+    bookkeeping only — no kernel round-trip — so it answers instantly even while the kernel
+    is busy, and it is always safe to call.
+
+    - status="running": that kernel is executing RIGHT NOW; `running` gives exec_id,
+      code_head and elapsed_seconds. Wait and poll; do not resend the code.
+    - status=<the finished execution's status>: the last COMPLETED foreground execution —
+      its code_head, output `text` (last `max_chars`), execution_count and timing.
+      `client_abandoned` means your client had already stopped listening when it finished,
+      i.e. this is precisely the result you were missing.
+    - status="none": nothing has run on this kernel through this server yet.
+
+    Only foreground executions are tracked, one per kernel, and only in memory (an mcp
+    restart clears it). Background jobs have get_job; a colab session's full history has
+    colab_log; a local notebook's cells hold the durable record."""
+    running = state.running_exec(kernel_id)
+    last = state._last_exec.get(kernel_id)
+    if running is not None:
+        out = {"kernel_id": kernel_id, "status": "running", "running": running,
+               "note": (f"kernel '{kernel_id}' is STILL executing (started "
+                        f"{running['elapsed_seconds']:.0f}s ago). Nothing to collect yet — wait "
+                        "and call this again. Do NOT resend the code; interrupt_kernel aborts it.")}
+        if last is not None:
+            out["previous"] = _last_exec_view(last, max_chars)
+        return out
+    if last is None:
+        return {"kernel_id": kernel_id, "status": "none",
+                "note": ("no foreground execution has been recorded for this kernel (it may be "
+                         "new, or the mcp server restarted since). Nothing is running.")}
+    return {"kernel_id": kernel_id, **_last_exec_view(last, max_chars)}
+
+
+def _last_exec_view(rec: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    """Client-facing shape of a recorded execution (internal bookkeeping stripped)."""
+    text = rec["text"][-max(256, int(max_chars)):]
+    out = {k: v for k, v in rec.items() if k not in ("code_sha", "finished", "text", "replayed")}
+    out["text"] = text
+    out["text_truncated"] = rec["text_truncated"] or len(text) < len(rec["text"])
+    if rec.get("client_abandoned"):
+        out["note"] = ("this execution COMPLETED after the call that started it stopped being "
+                       "listened to (client-side timeout/cancel) — it is the result you did not "
+                       "receive. The work already happened; do not run it again.")
+    return out
 
 
 @mcp.tool(annotations={"readOnlyHint": True})

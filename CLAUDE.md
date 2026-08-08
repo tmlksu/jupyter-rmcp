@@ -54,7 +54,8 @@ settled decision — most surprising choices here have a recorded reason.
 
 Package layout under `mcp/`: `server.py` (entry point, `/health`, uvicorn),
 `app.py` (the FastMCP singleton + auth + instructions), `config.py` (every
-`os.environ` read), `state.py` (process-wide singletons), `registry.py`
+`os.environ` read), `state.py` (process-wide singletons + the single-flight
+execution guard, ADR 0017), `registry.py`
 (persistent kernel tracking), `reaper.py` (idle/max-age reaping + lazy startup),
 `backends/` (the `Backend` protocol, routing, and one module per backend), and
 the four tool modules `kernels.py`, `notebook.py`, `jobs.py`, `workspace.py`

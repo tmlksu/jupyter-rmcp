@@ -29,7 +29,7 @@ from fastmcp import Client
 EXPECTED_TOOLS = {
     "list_kernels", "start_kernel", "stop_kernel", "restart_kernel",
     "interrupt_kernel", "pin_kernel", "colab_log",
-    "execute_code", "get_job", "execute_cell", "list_variables",
+    "execute_code", "get_job", "get_last_execution", "execute_cell", "list_variables",
     "notebook_rev", "list_cells", "read_cells", "insert_cells", "insert_cell",
     "patch_cell", "edit_cell", "delete_cell", "move_cell",
     "list_backends", "setup_kaggle", "setup_hf",
@@ -141,6 +141,33 @@ async def main() -> None:
 
             r = await client.call_tool("execute_code", {"kernel_id": kid, "code": "x + 1"})
             check("variable persists", "43" in r.data.get("text", ""), str(r.data))
+
+            # -- single-flight: a duplicate must be REFUSED, never queued (ADR 0017) --
+            # The regression this guards: a client gives up on a slow call, resends the
+            # same code, and the kernel runs it a second time. `_sf` counts real runs.
+            slow = "import time\n_sf = globals().get('_sf', 0) + 1\ntime.sleep(6)\nprint('sf', _sf)"
+            first = asyncio.ensure_future(
+                client.call_tool("execute_code", {"kernel_id": kid, "code": slow, "timeout": 60}))
+            await asyncio.sleep(2)
+            async with Client(url, auth=bearer or None) as retry_client:   # the "failed" call resent
+                r = await retry_client.call_tool("execute_code", {"kernel_id": kid, "code": slow})
+                check("duplicate execute refused", r.data.get("status") == "busy", str(r.data))
+                check("busy names it a retry", r.data.get("is_retry") is True, str(r.data))
+                check("busy reports elapsed",
+                      (r.data.get("running") or {}).get("elapsed_seconds", 0) > 0, str(r.data))
+
+                r = await retry_client.call_tool("get_last_execution", {"kernel_id": kid})
+                check("get_last_execution sees it running",
+                      r.data.get("status") == "running", str(r.data))
+            check("first execution completed", (await first).data.get("status") == "ok",
+                  str((await first).data))
+
+            r = await client.call_tool("get_last_execution", {"kernel_id": kid})
+            check("get_last_execution returns the result", "sf 1" in r.data.get("text", ""),
+                  str(r.data))
+
+            r = await client.call_tool("execute_code", {"kernel_id": kid, "code": "print('runs', _sf)"})
+            check("refused duplicate never ran", "runs 1" in r.data.get("text", ""), str(r.data))
 
             r = await client.call_tool("execute_code", {"kernel_id": kid, "code": "1/0"})
             check("error status", r.data.get("status") == "error", str(r.data))

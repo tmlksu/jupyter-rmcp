@@ -64,6 +64,25 @@ Per `execute_code`:
 5. Serialize concurrent executes to the **same** kernel with a per-kernel async
    lock (Jupyter queues them anyway; the lock keeps our output correlation clean).
 
+### Single-flight admission (ADR 0017)
+The lock above serializes; it does **not** decide whether a second execution
+*should* happen. That question matters because an MCP client abandons a call it
+finds slow, the agent resends the code, and a queued duplicate is how "the long
+job ran several times and broke" happens.
+
+So `execute_code` and `execute_cell` claim a per-kernel slot (`state._inflight`)
+for the whole call. A second one arriving meanwhile returns
+`{status: "busy", running: {exec_id, code_head, elapsed_seconds}, is_retry}` and
+runs **nothing**. A cancelled caller keeps holding the slot — the work is shielded
+and still running — and releases it from a done-callback when it truly ends;
+releasing early would just move the double-execution one step later.
+
+Each completed foreground execution is remembered (`state._last_exec`, one per
+kernel, in memory only) so `get_last_execution` can hand back the result of a
+call whose client stopped listening — and, if that exact code is resent within
+5 minutes, replay it once instead of running it again. Background jobs release
+the slot as soon as the detached process is spawned.
+
 ### Per-execution timeout
 Each execute has a timeout (tool arg, default `EXEC_TIMEOUT_SEC`). On expiry:
 1. `POST /interrupt` the kernel,
