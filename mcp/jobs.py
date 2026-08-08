@@ -17,12 +17,15 @@ inherits the kernel process env (so a prior setup_hf/setup_kaggle token carries 
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import time
 import uuid
 from typing import Any
 
 import backends
+import config
 import reaper
 import state
 from app import mcp
@@ -95,8 +98,9 @@ async def _execute_background(kernel_id: str, code: str) -> dict[str, Any]:
     return result
 
 
-async def _execute_foreground(kernel_id: str, code: str, timeout: float | None) -> dict[str, Any]:
-    reply = await backends._run_on_kernel(kernel_id, code, timeout)
+async def _execute_foreground(kernel_id: str, code: str, timeout: float | None,
+                              sink: list[dict[str, Any]]) -> dict[str, Any]:
+    reply = await backends._run_on_kernel(kernel_id, code, timeout, sink)
     result = backends._reply_result(reply)
     # A lost session ran nothing — skip write-back (there is no cell to append, and probing
     # _notebook_for_kernel would re-create a bare registry entry for the just-forgotten id).
@@ -110,21 +114,33 @@ async def execute_code(kernel_id: str, code: str, timeout: float | None = None,
                        background: bool = False) -> dict[str, Any]:
     """Run ad-hoc Python in the kernel (stateful; variables persist across calls) and
     **append** it as a new cell to the bound notebook (if any). For iterating on an
-    EXISTING cell without duplicating it, use execute_cell / edit_cell instead. On
-    timeout the kernel is interrupted. Works for local and colab backends.
+    EXISTING cell without duplicating it, use execute_cell / edit_cell instead. Works for
+    local and colab backends. `timeout` (optional) is a HARD cap: exceeding it INTERRUPTS
+    the kernel. Leave it unset for long work — see below; nothing is interrupted then.
 
     Foreground calls run through IPython, so `!shell` and `%magic` (e.g. `!pip install …`)
     DO work here. (Background jobs do NOT — see below.)
 
-    TIMEOUT ≠ FAILURE: a result with status="timeout" (timed_out=True) means the reply
-    didn't arrive in time, NOT that the code failed — the kernel may still be running (heavy
-    compute or large output can make the reply lag the visible stdout). Any output captured
-    before the cutoff is returned, and a `note` explains next steps.
+    IF THIS CALL APPEARS TO FAIL OR TIME OUT (a client-side error, or no response at all):
+    the code may STILL be running, or may have ALREADY completed, on the kernel. NEVER
+    resend the same code as your first response. Instead:
+      1. call get_execution(kernel_id) to see whether it is running or already finished
+         (colab_log also works for colab kernels)
+      2. if it is still running, poll get_execution(kernel_id, wait_seconds=20) until done
+      3. resend ONLY once you have CONFIRMED it never ran
+    Resending without checking is how one command becomes two: doubled file writes, doubled
+    pip installs, a counter incremented twice. The server refuses the obvious cases for you
+    (see "busy" below), but a confirmed check is what actually makes it safe.
 
-    NEVER RESEND A CALL THAT SEEMED TO FAIL. One kernel runs ONE execution at a time. If a
-    call is still in flight, this returns status="busy" and executes NOTHING (rather than
-    queueing your code to run a second time behind the first); collect the first call's
-    result with get_last_execution(kernel_id) instead of re-running it.
+    LONG WORK ANSWERS EARLY, IT IS NOT KILLED. If the execution outlives the server's reply
+    deadline you get {status: "still_running", exec_id, partial_output} — the code keeps
+    running on the kernel, nothing was interrupted, and get_execution collects the result
+    (and its notebook write-back) when it finishes. status="timeout" appears only when YOU
+    passed `timeout`, which is a hard cap that interrupts the kernel.
+
+    ONE EXECUTION PER KERNEL: a call arriving while another is in flight returns
+    status="busy" and executes NOTHING, rather than queueing your code to run a second time
+    behind the first. `is_retry` tells you it was your own resend.
 
     `background=True` — for LONG jobs (model download, training): the code runs as a detached
     OS process on the kernel host/VM and this returns IMMEDIATELY with {status:
@@ -141,52 +157,70 @@ async def execute_code(kernel_id: str, code: str, timeout: float | None = None,
     1000 iters/call) that checkpoint to disk, rather than one giant background job."""
     reaper._ensure_background()
 
-    async def _run() -> dict[str, Any]:
+    async def _run(sink: list[dict[str, Any]]) -> dict[str, Any]:
         if background:
             return await _execute_background(kernel_id, code)
-        return await _execute_foreground(kernel_id, code, timeout)
+        return await _execute_foreground(kernel_id, code, timeout, sink)
 
     # The background LAUNCH is an exec too (it runs on the kernel), so it takes the same
     # slot — but only for the second or two it takes to spawn the detached process; the
     # job itself holds nothing, which is why long work belongs there.
-    return await state.run_single_flight(kernel_id, code, "execute_code", _run)
+    return await state.run_single_flight(kernel_id, code, "execute_code", _run,
+                                         deadline=config.SOFT_REPLY_DEADLINE_SEC)
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
-async def get_last_execution(kernel_id: str, max_chars: int = 4000) -> dict[str, Any]:
-    """What is (or was) running on this kernel — the answer to a call that never came back.
+async def get_execution(kernel_id: str, exec_id: str | None = None, wait_seconds: float = 0,
+                        max_chars: int = 4000) -> dict[str, Any]:
+    """Collect a foreground execution — the answer to any call that did not come back.
 
-    Use this INSTEAD of re-running code whenever an execute_code/execute_cell call appeared
-    to fail, timed out client-side, or came back status="busy". It reads in-process
-    bookkeeping only — no kernel round-trip — so it answers instantly even while the kernel
-    is busy, and it is always safe to call.
+    Call this INSTEAD of re-running code whenever execute_code/execute_cell returned
+    status="still_running" or status="busy", timed out on your side, or errored in your
+    client. It reads in-process bookkeeping (no kernel round-trip), so it answers even
+    while the kernel is busy and is always safe to call. `exec_id` is optional — omit it
+    for "whatever is or was running on this kernel".
 
-    - status="running": that kernel is executing RIGHT NOW; `running` gives exec_id,
-      code_head and elapsed_seconds. Wait and poll; do not resend the code.
-    - status=<the finished execution's status>: the last COMPLETED foreground execution —
-      its code_head, output `text` (last `max_chars`), execution_count and timing.
-      `client_abandoned` means your client had already stopped listening when it finished,
-      i.e. this is precisely the result you were missing.
+    `wait_seconds` LONG-POLLS: wait up to that many seconds for the execution to finish
+    before answering (clamped below the server's reply deadline). One call with
+    wait_seconds=20 beats twenty polls.
+
+    - status="running": still going; `running` has exec_id, code_head, elapsed_seconds and
+      `partial_output` (what it has printed so far — local kernels only). Poll again. Do
+      NOT resend the code. `interrupt_kernel` aborts it if you actually want it stopped.
+    - status=<a finished status: ok / error / timeout / session_lost>: the completed
+      execution — code_head, output `text` (last `max_chars`), execution_count, timing and
+      `saved_to` (the notebook it was written back to). `client_abandoned` means your
+      client had already stopped listening, i.e. this is precisely the result you missed.
     - status="none": nothing has run on this kernel through this server yet.
 
-    Only foreground executions are tracked, one per kernel, and only in memory (an mcp
-    restart clears it). Background jobs have get_job; a colab session's full history has
-    colab_log; a local notebook's cells hold the durable record."""
+    One foreground execution is remembered per kernel, in memory only (an mcp restart
+    clears it). Background jobs have get_job; a colab session's history has colab_log; the
+    notebook cells are the durable record."""
+    reaper._ensure_background()
+    if wait_seconds and wait_seconds > 0:
+        await state.wait_for_exec(kernel_id, exec_id, min(float(wait_seconds), _MAX_WAIT))
     running = state.running_exec(kernel_id)
     last = state._last_exec.get(kernel_id)
-    if running is not None:
-        out = {"kernel_id": kernel_id, "status": "running", "running": running,
-               "note": (f"kernel '{kernel_id}' is STILL executing (started "
-                        f"{running['elapsed_seconds']:.0f}s ago). Nothing to collect yet — wait "
-                        "and call this again. Do NOT resend the code; interrupt_kernel aborts it.")}
-        if last is not None:
-            out["previous"] = _last_exec_view(last, max_chars)
-        return out
-    if last is None:
-        return {"kernel_id": kernel_id, "status": "none",
-                "note": ("no foreground execution has been recorded for this kernel (it may be "
-                         "new, or the mcp server restarted since). Nothing is running.")}
-    return {"kernel_id": kernel_id, **_last_exec_view(last, max_chars)}
+    if running is not None and (exec_id is None or running["exec_id"] == exec_id):
+        running["partial_output"] = state.partial_output(kernel_id, max_chars)
+        return {"kernel_id": kernel_id, "status": "running", "running": running,
+                "note": (f"kernel '{kernel_id}' is STILL executing (started "
+                         f"{running['elapsed_seconds']:.0f}s ago) — nothing to collect yet, and "
+                         "NOT a failure. Poll again with wait_seconds; do not resend the code. "
+                         "interrupt_kernel aborts it if you want it stopped.")}
+    if last is not None and (exec_id is None or last["exec_id"] == exec_id):
+        return {"kernel_id": kernel_id, **_last_exec_view(last, max_chars)}
+    if exec_id is not None:
+        return {"kernel_id": kernel_id, "exec_id": exec_id, "status": "unknown",
+                "note": ("no execution with that exec_id is running or remembered on this kernel "
+                         "(only the most recent one is kept, and an mcp restart clears it). Call "
+                         "without exec_id to see the latest, or read the notebook cells.")}
+    return {"kernel_id": kernel_id, "status": "none",
+            "note": ("no foreground execution has been recorded for this kernel (it may be new, "
+                     "or the mcp server restarted since). Nothing is running.")}
+
+
+_MAX_WAIT = max(5.0, config.SOFT_REPLY_DEADLINE_SEC - 5)   # stay inside the client's patience
 
 
 def _last_exec_view(rec: dict[str, Any], max_chars: int) -> dict[str, Any]:
@@ -204,11 +238,16 @@ def _last_exec_view(rec: dict[str, Any], max_chars: int) -> dict[str, Any]:
 
 @mcp.tool(annotations={"readOnlyHint": True})
 async def get_job(kernel_id: str, job_id: str, offset: int | None = None,
-                  max_chars: int = 4000) -> dict[str, Any]:
+                  max_chars: int = 4000, wait_seconds: float = 0) -> dict[str, Any]:
     """Poll a background job started by execute_code(background=True): returns its `status`
     ("running_in_background" / "done" / "error" / "unknown") and a WINDOW of the stdout+stderr
     it has captured (unbuffered — live progress shows). Cheap, non-blocking; call repeatedly
     until status is no longer "running_in_background".
+
+    `wait_seconds` > 0 LONG-POLLS: keep checking until the job leaves the running state or
+    that many seconds pass (clamped below the server's reply deadline), then answer. One
+    call with wait_seconds=20 beats twenty polls. While a job is running, do NOT resend the
+    execute_code that started it — it is running, not failed.
 
     Output is windowed so a chatty job doesn't flood you: by DEFAULT you get the LAST
     `max_chars` (the latest progress) plus `total_chars` (full size) and `next_offset` (the
@@ -219,6 +258,22 @@ async def get_job(kernel_id: str, job_id: str, offset: int | None = None,
     `next_offset`. The job ran in its own process — read any results it persisted to a file
     (execute_code / download_from_colab)."""
     reaper._ensure_background()
+    wait = min(float(wait_seconds or 0), _MAX_WAIT)
+    deadline = time.monotonic() + wait
+    while True:
+        out = await _poll_job(kernel_id, job_id, offset, max_chars)
+        if out.get("status") != "running_in_background" or time.monotonic() >= deadline:
+            return out
+        # Sleep in coarse steps: each poll is a real kernel exec, so a tight loop would
+        # both waste the kernel and queue behind any foreground execution.
+        await asyncio.sleep(min(_JOB_POLL_INTERVAL_SEC, max(0.0, deadline - time.monotonic())))
+
+
+_JOB_POLL_INTERVAL_SEC = 5.0
+
+
+async def _poll_job(kernel_id: str, job_id: str, offset: int | None,
+                    max_chars: int) -> dict[str, Any]:
     off_lit = "None" if offset is None else str(int(offset))
     mx = max(256, int(max_chars))
     poll = (

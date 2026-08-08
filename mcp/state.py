@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from config import JUPYTER_TOKEN, JUPYTER_URL, LOCAL, MCP_STATE_DIR, log
+from outputs import _format_outputs
 from registry import KernelRegistry
 from util import _now
 
@@ -76,9 +77,10 @@ _inflight: dict[str, dict[str, Any]] = {}    # kernel_id -> the execution runnin
 _last_exec: dict[str, dict[str, Any]] = {}   # kernel_id -> the last one that COMPLETED
 
 _CODE_HEAD_CHARS = 120     # how much code is echoed back to identify an execution
-_LAST_TEXT_CHARS = 8000    # output text retained per kernel for get_last_execution
+_LAST_TEXT_CHARS = 8000    # output text retained per kernel for get_execution
 _LAST_EXEC_MAX = 256       # cap on remembered kernels (stop_kernel normally prunes)
 _REPLAY_WINDOW_SEC = 300.0  # how long an abandoned execution's result stays replayable
+_PARTIAL_TEXT_CHARS = 4000  # tail of the live output shown with a still_running reply
 
 
 def _code_sha(code: str) -> str:
@@ -92,14 +94,15 @@ def running_exec(kernel_id: str) -> dict[str, Any] | None:
         return None
     return {"exec_id": info["exec_id"], "tool": info["tool"], "code_head": info["code_head"],
             "started_at": info["started_at"],
+            "detached": bool(info.get("detached") or info.get("abandoned")),
             "elapsed_seconds": round(time.monotonic() - info["started"], 1)}
 
 
 def _next_action(kernel_id: str) -> str:
-    return (f"WAIT, then call get_last_execution('{kernel_id}') to collect the result once it "
-            "finishes (it never touches the kernel, so it answers even while one is busy; for a "
-            "colab kernel colab_log also works). To ABORT the running execution instead, call "
-            "interrupt_kernel. For work that legitimately takes minutes, use "
+    return (f"WAIT, then call get_execution('{kernel_id}', wait_seconds=20) to collect the "
+            "result once it finishes (it never touches the kernel, so it answers even while one "
+            "is busy; for a colab kernel colab_log also works). To ABORT the running execution "
+            "instead, call interrupt_kernel. For work that legitimately takes minutes, use "
             "execute_code(background=True) + get_job, which returns immediately.")
 
 
@@ -145,10 +148,14 @@ def _take_replay(kernel_id: str, code: str) -> dict[str, Any] | None:
     return out
 
 
-def _record_exec(kernel_id: str, info: dict[str, Any], result: dict[str, Any],
-                 abandoned: bool = False) -> None:
+def _record_exec(kernel_id: str, info: dict[str, Any], result: dict[str, Any]) -> None:
     """Remember a COMPLETED foreground execution so its result survives the client that
-    stopped listening for it. One entry per kernel — the point is recovery, not history."""
+    stopped listening for it. One entry per kernel — the point is recovery, not history.
+
+    `client_abandoned` (the caller cancelled, so it got NOTHING) is tracked apart from
+    `detached` (we answered `still_running`, so the caller holds an exec_id): only the
+    former licenses a one-shot replay, because only there is a resend certainly blind."""
+    abandoned = bool(info.get("abandoned"))
     text = str(result.get("text") or "")
     _last_exec[kernel_id] = {
         "exec_id": info["exec_id"], "tool": info["tool"], "code_head": info["code_head"],
@@ -159,6 +166,7 @@ def _record_exec(kernel_id: str, info: dict[str, Any], result: dict[str, Any],
         "duration_seconds": round(time.monotonic() - info["started"], 1),
         "started_at": info["started_at"], "finished_at": _now().isoformat(),
         "finished": time.monotonic(), "client_abandoned": abandoned,
+        "detached": bool(info.get("detached")),
     }
     while len(_last_exec) > _LAST_EXEC_MAX:
         _last_exec.pop(next(iter(_last_exec)))
@@ -178,36 +186,16 @@ def forget_exec(kernel_id: str) -> None:
     _last_exec.pop(kernel_id, None)
 
 
-async def run_single_flight(kernel_id: str, code: str, tool: str,
-                            runner: Callable[[], Awaitable[dict[str, Any]]]) -> dict[str, Any]:
-    """Run `runner` as the kernel's one foreground execution, or refuse with `status: busy`.
+async def _guarded(kernel_id: str, info: dict[str, Any],
+                   runner: Callable[[list], Awaitable[dict[str, Any]]]) -> dict[str, Any]:
+    """The execution itself, wrapped so that release + recording happen INSIDE the task.
 
-    Three exits, and every one of them leaves the guard consistent:
-      - kernel free      -> claim, run, release, remember the result
-      - kernel busy      -> return the refusal payload, having run NOTHING
-      - caller cancelled -> keep the claim held and release it from a done-callback when
-        the work actually finishes. This is the case that matters: a client that gave up
-        may cancel the request, and releasing then would let its retry double-execute.
-        The work is shielded, so it keeps running on the kernel either way.
-    """
-    busy = _busy_result(kernel_id, code)
-    if busy is not None:
-        return busy
-    replay = _take_replay(kernel_id, code)
-    if replay is not None:
-        return replay
-    info = {"exec_id": "exec-" + uuid.uuid4().hex[:8], "tool": tool,
-            "code_sha": _code_sha(code), "code_head": code[:_CODE_HEAD_CHARS],
-            "started": time.monotonic(), "started_at": _now().isoformat()}
-    _inflight[kernel_id] = info
-    task = asyncio.ensure_future(runner())
+    Doing the bookkeeping here rather than in a done-callback is what lets any observer
+    trust `task.done()`: by the time the task completes, the claim is gone and the result
+    is in `_last_exec`. A callback would run a tick later, and `get_execution`'s long poll
+    would race it."""
     try:
-        result = await asyncio.shield(task)
-    except asyncio.CancelledError:
-        log.info("%s on %s: caller went away; holding the kernel claim until it finishes",
-                 tool, kernel_id)
-        task.add_done_callback(lambda t: _on_abandoned(kernel_id, info, t))
-        raise
+        result = await runner(info["sink"])
     except BaseException as e:
         _release(kernel_id, info["exec_id"])
         _record_exec(kernel_id, info, {"status": "error", "text": f"{type(e).__name__}: {e}"})
@@ -218,13 +206,95 @@ async def run_single_flight(kernel_id: str, code: str, tool: str,
     return result
 
 
-def _on_abandoned(kernel_id: str, info: dict[str, Any], task: asyncio.Future) -> None:
-    """Release + remember an execution whose caller had already stopped listening."""
-    _release(kernel_id, info["exec_id"])
+def _still_running(kernel_id: str, info: dict[str, Any]) -> dict[str, Any]:
+    """The soft-deadline reply: an honest 'not done yet', which beats no reply at all."""
+    running = running_exec(kernel_id) or {}
+    return {
+        "status": "still_running", "kernel_id": kernel_id, "exec_id": info["exec_id"],
+        "elapsed_seconds": running.get("elapsed_seconds"),
+        "partial_output": _sink_text(info["sink"])[-_PARTIAL_TEXT_CHARS:],
+        "note": (
+            f"The code is STILL RUNNING on kernel '{kernel_id}' — this is NOT a failure and "
+            "NOT a reason to resend it. Nothing was interrupted; the server answered early so "
+            "your client would not time out waiting. Poll "
+            f"get_execution('{kernel_id}', wait_seconds=20) until it returns a final status; "
+            "the full output and the notebook write-back land there when it finishes. "
+            "`partial_output` is what the kernel has printed so far (local kernels only). If "
+            "you expected this to be long, prefer execute_code(background=True) next time — "
+            "it returns immediately and streams via get_job."),
+    }
+
+
+def _sink_text(sink: list) -> str:
+    """Whatever the running execution has printed so far (empty when live capture is
+    unavailable, e.g. the colab backend, which only hands back output at the end)."""
+    if not sink:
+        return ""
     try:
-        result = task.result()
+        _, text = _format_outputs(list(sink))
+    except Exception:  # noqa: BLE001 — a half-written output must never break the reply
+        return ""
+    return text
+
+
+async def run_single_flight(kernel_id: str, code: str, tool: str,
+                            runner: Callable[[list], Awaitable[dict[str, Any]]],
+                            deadline: float | None = None) -> dict[str, Any]:
+    """Run `runner` as the kernel's one foreground execution, and ALWAYS answer in time.
+
+    Four exits, and every one of them leaves the guard consistent:
+      - kernel busy      -> the refusal payload, having run NOTHING
+      - runs in time     -> claim, run, release, remember the result
+      - hits the soft deadline -> DETACH: the work keeps running, the claim stays held,
+        and the caller gets `still_running` + an exec_id to poll. Answering late is the
+        same as not answering — the client has already given up and told the agent it
+        failed (ADR 0018).
+      - caller cancelled -> same thing, minus the reply: the claim stays held until the
+        work really ends, because releasing it would let the client's retry re-execute.
+
+    The work is shielded in both detach cases, so nothing on the kernel is ever killed by
+    this function; only a caller-supplied `timeout` interrupts a kernel.
+    """
+    busy = _busy_result(kernel_id, code)
+    if busy is not None:
+        return busy
+    replay = _take_replay(kernel_id, code)
+    if replay is not None:
+        return replay
+    info: dict[str, Any] = {
+        "exec_id": "exec-" + uuid.uuid4().hex[:8], "tool": tool,
+        "code_sha": _code_sha(code), "code_head": code[:_CODE_HEAD_CHARS],
+        "started": time.monotonic(), "started_at": _now().isoformat(),
+        "sink": [], "detached": False, "abandoned": False}
+    _inflight[kernel_id] = info
+    task = asyncio.ensure_future(_guarded(kernel_id, info, runner))
+    info["task"] = task
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=deadline)
+    except TimeoutError:
+        info["detached"] = True
+        log.info("%s on %s: soft deadline reached; detaching %s", tool, kernel_id, info["exec_id"])
+        return _still_running(kernel_id, info)
     except asyncio.CancelledError:
-        result = {"status": "cancelled", "text": ""}
-    except BaseException as e:  # noqa: BLE001
-        result = {"status": "error", "text": f"{type(e).__name__}: {e}"}
-    _record_exec(kernel_id, info, result, abandoned=True)
+        info["abandoned"] = True
+        log.info("%s on %s: caller went away; holding the kernel claim until it finishes",
+                 tool, kernel_id)
+        raise
+
+
+def partial_output(kernel_id: str, max_chars: int = _PARTIAL_TEXT_CHARS) -> str:
+    """What the kernel's running execution has printed so far ("" if none / not capturable)."""
+    info = _inflight.get(kernel_id)
+    return "" if info is None else _sink_text(info["sink"])[-max(256, int(max_chars)):]
+
+
+async def wait_for_exec(kernel_id: str, exec_id: str | None, seconds: float) -> None:
+    """Block up to `seconds` for the kernel's running execution to finish. Never cancels
+    it: a poller giving up must not kill the work it was waiting on."""
+    info = _inflight.get(kernel_id)
+    if info is None or (exec_id is not None and info["exec_id"] != exec_id):
+        return
+    task = info.get("task")
+    if task is None or seconds <= 0:
+        return
+    await asyncio.wait({task}, timeout=seconds)

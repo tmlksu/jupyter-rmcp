@@ -20,17 +20,45 @@ public release — earlier history is the private development of the same code.
   recorded result is replayed once instead of re-executed. See
   [ADR 0017](docs/adr/0017-single-flight-execution.md).
 
+- **A long execution always gets an answer, and is never killed to produce one.**
+  The server used to spend up to `EXEC_TIMEOUT_SEC` (120 s) building a careful
+  timeout reply for a client that had stopped listening 60 s earlier — so the
+  agent saw a failed call and resent the code, and the 120 s cap meanwhile killed
+  exactly the long jobs this server exists to host. The two clocks are now
+  separate: `SOFT_REPLY_DEADLINE_SEC` (45 s) bounds the *reply*, after which the
+  execution **detaches** and returns `{status: "still_running", exec_id,
+  partial_output}` while it keeps running; `EXEC_TIMEOUT_SEC` bounds the *work* by
+  interrupting the kernel, and now defaults to `0` (no cap). A `timeout` you pass
+  yourself still interrupts. See
+  [ADR 0018](docs/adr/0018-soft-reply-deadline.md).
+
 ### Added
-- **`get_last_execution(kernel_id)` — what happened to the call that never came
-  back.** Reports the execution running right now, or the last completed one
-  (status, code head, output, timing), flagging the ones whose caller had already
-  stopped listening. It reads in-process state with no kernel round-trip, so it
+- **`get_execution(kernel_id, exec_id=None, wait_seconds=0)` — what happened to
+  the call that never came back.** Reports the execution running right now (with
+  `partial_output`: what it has printed so far, live) or the last completed one
+  (status, code head, output, timing, notebook write-back), flagging the ones
+  whose caller had already stopped listening. `wait_seconds` long-polls, so one
+  call replaces twenty. It reads in-process state with no kernel round-trip, so it
   answers *while* the kernel is busy — the moment it is actually needed. The
   local-kernel counterpart to `colab_log`. Tool surface: 31 → 32.
+- `get_job(..., wait_seconds=20)` long-polls a background job the same way.
+- `/health` reports `soft_reply_deadline_sec` and `exec_hard_timeout_sec`, so a
+  deployment's actual execution policy is checkable from outside.
+- Tool descriptions now spell out the protocol for a call that appears to fail —
+  check `get_execution` first, resend only once you have confirmed it never ran —
+  on `execute_code`, `execute_cell`, `get_job`, `start_kernel` (check
+  `list_kernels` before starting a second kernel) and `interrupt_kernel`.
 - `tests/test_singleflight.py` — pins the behavior that silently breaks: the
   second call executing nothing, the claim being released down every exit path
-  (ok / error / timeout / session_lost / cancelled caller), and a cancelled
-  caller's retry still being refused.
+  (ok / error / timeout / session_lost / cancelled caller), a cancelled caller's
+  retry still being refused, and the soft deadline detaching rather than killing.
+
+### Changed
+- **`EXEC_TIMEOUT_SEC` now defaults to `0` (no hard cap) and its meaning is
+  narrower**: it is the deadline at which the kernel is *interrupted*, not the one
+  at which you get a reply. **Upgrade note:** an existing `.env` pinning
+  `EXEC_TIMEOUT_SEC=120` keeps interrupting long executions at two minutes — set
+  it to `0` to get the detach-and-keep-running behavior.
 
 ## [1.0.0] — 2026-07-22
 

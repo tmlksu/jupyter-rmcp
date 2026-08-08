@@ -10,10 +10,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import uuid
+from functools import partial
 from typing import Any
 
 import httpx
 from jupyter_kernel_client import KernelClient
+from jupyter_kernel_client.client import output_hook as _output_hook
 
 import state
 from config import EXEC_TIMEOUT_SEC, LOCAL, log
@@ -223,26 +225,61 @@ async def _drop_client(kernel_id: str) -> None:
             log.warning("error stopping client %s: %s", kernel_id, e)
 
 
+def _execute_streaming(kc: KernelClient, code: str, sink: list[dict[str, Any]],
+                       timeout: float) -> dict[str, Any]:
+    """`KernelClient.execute`, but appending each output to `sink` AS IT ARRIVES.
+
+    The library builds its output list in a local and only hands it back at the end, so a
+    long execution looks silent until it finishes — exactly when we most need to show that
+    it is alive (the `still_running` reply, ADR 0018). `execute_interactive`'s output_hook
+    is the supported seam for this; reaching it means going through the manager's client,
+    so an upstream reshuffle falls back to the plain call rather than breaking execution."""
+    try:
+        client = kc._manager.client
+        reply = client.execute_interactive(
+            code, allow_stdin=False, stop_on_error=True, timeout=timeout,
+            output_hook=partial(_output_hook, sink))
+    except AttributeError:  # pragma: no cover - upstream shape changed
+        log.warning("live output capture unavailable; falling back to buffered execute")
+        return kc.execute(code, timeout=timeout)
+    content = reply["content"]
+    for output in sink:
+        output.pop("transient", None)
+    return {"execution_count": content.get("execution_count"), "outputs": list(sink),
+            "status": content["status"]}
+
+
 # ---- local execution (the jupyter branch of the old _run_on_kernel) ---------
-async def exec_local(kernel_id: str, backend: str, code: str,
-                     timeout: float | None = None) -> dict[str, Any]:
+async def exec_local(kernel_id: str, backend: str, code: str, timeout: float | None = None,
+                     output_sink: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Execute code on a LOCAL Jupyter kernel; return a normalized reply
-    {status, execution_count, outputs(nbformat), timed_out}. No notebook write-back."""
+    {status, execution_count, outputs(nbformat), timed_out}. No notebook write-back.
+
+    `timeout` (or EXEC_TIMEOUT_SEC when it is set) is a HARD cap: it INTERRUPTS the kernel.
+    With neither set there is no cap and nothing is interrupted — a long execution is meant
+    to be detached and polled, not killed (ADR 0018). `output_sink` receives outputs as
+    they arrive so a detached execution can show live progress."""
     # Verify the kernel actually exists before attaching, so we never auto-create or
     # attach to a phantom (a stopped/reaped id must fail cleanly, not mis-route).
     if not any(k.get("id") == kernel_id for k in await _kernels(backend)):
         raise RuntimeError(f"kernel '{kernel_id}' not found on backend '{backend}' — it was stopped "
                            "or reaped. Start a new kernel with start_kernel().")
     to = float(timeout) if timeout else EXEC_TIMEOUT_SEC
+    sink = output_sink if output_sink is not None else []
     lock = state._locks.setdefault(kernel_id, asyncio.Lock())
     async with lock:
         kc = await _get_client(kernel_id)
         # jupyter_client's `timeout` does NOT bound total run time; enforce it here.
         # The worker thread can't be cancelled, so shield it, interrupt on timeout,
         # then wait a grace for it to unwind — holding the per-kernel lock throughout.
-        task = asyncio.ensure_future(asyncio.to_thread(kc.execute, code, timeout=to + 3600))
+        task = asyncio.ensure_future(
+            asyncio.to_thread(_execute_streaming, kc, code, sink, (to or 0) + 3600))
         try:
-            reply = await asyncio.wait_for(asyncio.shield(task), timeout=to)
+            # No hard cap (`to` == 0): wait for the work itself. Detaching
+            # (state.run_single_flight) is what keeps the CALLER responsive; nothing here
+            # kills the execution, so a long job is never truncated by a default.
+            reply = (await asyncio.wait_for(asyncio.shield(task), timeout=to) if to
+                     else await asyncio.shield(task))
         except TimeoutError:
             log.info("execute exceeded %.0fs on %s; interrupting", to, kernel_id)
             try:

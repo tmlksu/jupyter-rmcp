@@ -47,7 +47,7 @@ kernels had nothing at all.
    keeps running, so the claim is held and released from a done-callback when the
    execution actually ends. Releasing on cancellation would hand the retry an
    idle-looking kernel — race 2, manufactured by the fix for race 1.
-4. **`get_last_execution(kernel_id)` — a new tool.** In-process bookkeeping only,
+4. **`get_execution(kernel_id)` — a new tool.** In-process bookkeeping only,
    no kernel round-trip, so it answers *while* the kernel is busy, which is the
    one moment it's needed. It reports either the running execution or the last
    completed one (status, `code_head`, output text, `execution_count`, timing),
@@ -71,7 +71,7 @@ kernel nobody can ever use again.
 
 ## Consequences
 
-- The tool surface goes 31 → 32 (`get_last_execution`), updated in
+- The tool surface goes 31 → 32 (`get_execution`), updated in
   `tests/test_tool_surface.py` and `scripts/smoke_test.py` in the same commit as
   the invariant requires. Deployment mode still changes behavior, never the API.
 - `status: "busy"` is a new outcome callers must tolerate. The server
@@ -85,7 +85,7 @@ kernel nobody can ever use again.
 - Polling tools that run code on the kernel (`get_job`, `list_variables`) are
   *not* admission-controlled; they would otherwise be refused exactly when the
   busy note tells the agent to poll. They still queue behind a running execution,
-  which is why `get_last_execution` touches the kernel not at all.
+  which is why `get_execution` touches the kernel not at all.
 - A colab session lost mid-execution keeps its recorded `session_lost` result
   (`_forget_colab` deliberately doesn't clear it) — the last thing that ran
   before a VM vanished is worth reading.

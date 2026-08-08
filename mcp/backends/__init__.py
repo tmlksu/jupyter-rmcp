@@ -88,14 +88,19 @@ async def _resolve_backend(kernel_id: str) -> str:
     return backend
 
 
-async def _run_on_kernel(kernel_id: str, code: str, timeout: float | None = None) -> dict[str, Any]:
+async def _run_on_kernel(kernel_id: str, code: str, timeout: float | None = None,
+                         output_sink: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Execute code on a kernel (any backend); return a normalized reply
     {status, execution_count, outputs(nbformat), timed_out}. No notebook write-back.
-    Routing is explicit (unknown id raises — never a silent LOCAL fallback)."""
+    Routing is explicit (unknown id raises — never a silent LOCAL fallback).
+
+    `output_sink`, when given, is filled with outputs AS THEY ARRIVE so a detached
+    execution can report live progress. Only the local backend can do that; colab-cli
+    hands its output back in one piece at the end, so the sink stays empty there."""
     backend = await _resolve_backend(kernel_id)
     if is_cli(backend):
         return await colab_cli.exec_colab(kernel_id, code, timeout)
-    return await local_jupyter.exec_local(kernel_id, backend, code, timeout)
+    return await local_jupyter.exec_local(kernel_id, backend, code, timeout, output_sink)
 
 
 def _reply_result(reply: dict[str, Any]) -> dict[str, Any]:

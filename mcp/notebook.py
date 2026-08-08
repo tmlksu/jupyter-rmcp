@@ -14,6 +14,7 @@ import uuid
 from typing import Any
 
 import backends
+import config
 import reaper
 import state
 from app import mcp
@@ -275,9 +276,11 @@ async def execute_cell(kernel_id: str, index: int | None = None, cell_id: str | 
     outputs in place (no duplicate). Target by `cell_id` (stable, preferred) OR `index`.
     Editing (patch_cell/edit_cell) is separate — this only runs a cell as-is.
 
-    Shares the kernel's single execution slot with execute_code: if something is already
-    running there this returns status="busy" and runs NOTHING. Never resend a call that
-    seemed to fail — collect it with get_last_execution(kernel_id)."""
+    IF THIS CALL APPEARS TO FAIL OR TIME OUT, the cell may still be running or may have
+    ALREADY completed. NEVER resend it as your first move — call get_execution(kernel_id)
+    to find out, and only re-run once you have CONFIRMED it never ran. Long cells come back
+    as status="still_running" with an exec_id rather than hanging, and a call arriving while
+    another execution holds this kernel returns status="busy" having run NOTHING."""
     reaper._ensure_background()
     path = await _require_notebook(kernel_id)
     nb = await _load_nb(path)
@@ -288,8 +291,8 @@ async def execute_cell(kernel_id: str, index: int | None = None, cell_id: str | 
     cid = cell.get("id")
     source = _norm_source(cell)
 
-    async def _run() -> dict[str, Any]:
-        reply = await backends._run_on_kernel(kernel_id, source, timeout)
+    async def _run(sink: list[dict[str, Any]]) -> dict[str, Any]:
+        reply = await backends._run_on_kernel(kernel_id, source, timeout, sink)
         nb = await _load_nb(path)  # re-read to avoid clobbering concurrent edits; find by id
         matches = [j for j, c in enumerate(nb["cells"]) if c.get("id") == cid]
         if matches:
@@ -300,7 +303,8 @@ async def execute_cell(kernel_id: str, index: int | None = None, cell_id: str | 
         res.update({"path": path, "id": cid, "rev": _rev(nb)})
         return res
 
-    return await state.run_single_flight(kernel_id, source, "execute_cell", _run)
+    return await state.run_single_flight(kernel_id, source, "execute_cell", _run,
+                                         deadline=config.SOFT_REPLY_DEADLINE_SEC)
 
 
 @mcp.tool

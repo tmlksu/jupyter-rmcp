@@ -77,18 +77,38 @@ runs **nothing**. A cancelled caller keeps holding the slot — the work is shie
 and still running — and releases it from a done-callback when it truly ends;
 releasing early would just move the double-execution one step later.
 
-Each completed foreground execution is remembered (`state._last_exec`, one per
-kernel, in memory only) so `get_last_execution` can hand back the result of a
-call whose client stopped listening — and, if that exact code is resent within
-5 minutes, replay it once instead of running it again. Background jobs release
-the slot as soon as the detached process is spawned.
+A detached execution (soft deadline, above) keeps holding the slot for as long as it
+runs — the kernel really is occupied — so every other call on it gets `busy`.
 
-### Per-execution timeout
-Each execute has a timeout (tool arg, default `EXEC_TIMEOUT_SEC`). On expiry:
+Each completed foreground execution is remembered (`state._last_exec`, one per
+kernel, in memory only) so `get_execution` can hand back the result of a
+call whose client stopped listening — and, if that exact code is resent within
+5 minutes, replay it once instead of running it again. That replay is licensed only
+by a *cancelled* caller (which received nothing), never by a detached one (which
+holds an exec_id). Background jobs release the slot as soon as the detached process
+is spawned.
+
+### Two clocks, not one (ADR 0018)
+How long the **caller** waits and how long the **work** may live are separate:
+
+| | knob | default | on expiry |
+|---|---|---|---|
+| reply | `SOFT_REPLY_DEADLINE_SEC` | 45 s | detach: `still_running` + `exec_id`, work continues |
+| work | `EXEC_TIMEOUT_SEC` (or the `timeout` arg) | 0 = none | `POST /interrupt` the kernel |
+
+Conflating them is what produced the original bug: the server spent 120 s building a
+careful timeout reply for a client that had given up at 60 s, and the same 120 s
+killed the long jobs the server exists to host.
+
+Only an explicit deadline interrupts anything. On expiry of that one:
 1. `POST /interrupt` the kernel,
 2. wait a short grace for the `error`/`reply`,
 3. return `{status: "timeout", outputs: <partial>, timed_out: true}`.
-Never block indefinitely.
+
+Outputs are streamed into a per-execution sink as they arrive (via
+`execute_interactive`'s `output_hook`, with a fallback to the buffered call), so a
+detached execution can report `partial_output` instead of looking dead. Local backend
+only — colab-cli returns its output in one piece at the end.
 
 **Implementation note (verified empirically):** `jupyter-kernel-client` /
 `jupyter_client`'s own `timeout` argument does **not** bound total execution time

@@ -60,7 +60,12 @@ services:
       # Colab-only deployment: refuse to execute code on the local backend (the local
       # Jupyter still stores/serves the notebooks). Requires working ADC creds below.
       - COLAB_ONLY=${COLAB_ONLY:-}
-      - EXEC_TIMEOUT_SEC=${EXEC_TIMEOUT_SEC}
+      # HARD cap that INTERRUPTS a foreground execution. 0 (default) = no cap; long work
+      # is detached and polled instead of killed. See SOFT_REPLY_DEADLINE_SEC.
+      - EXEC_TIMEOUT_SEC=${EXEC_TIMEOUT_SEC:-0}
+      # When a foreground execution outlives this, the server answers "still_running"
+      # anyway (the work continues). Must stay under the MCP client's tool timeout.
+      - SOFT_REPLY_DEADLINE_SEC=${SOFT_REPLY_DEADLINE_SEC:-45}
       - KERNEL_IDLE_TIMEOUT_SEC=${KERNEL_IDLE_TIMEOUT_SEC}
       - KERNEL_MAX_AGE_SEC=${KERNEL_MAX_AGE_SEC}
       - MAX_KERNELS=${MAX_KERNELS}

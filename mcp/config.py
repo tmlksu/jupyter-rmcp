@@ -48,7 +48,18 @@ if not JUPYTER_TOKEN:
         "`python3 -c 'import secrets; print(secrets.token_hex(32))'` and set it in .env.")
 MCP_BEARER = _env("MCP_BEARER", "")
 MCP_PORT = int(_env("MCP_PORT", "8000"))
-EXEC_TIMEOUT_SEC = float(_env("EXEC_TIMEOUT_SEC", "120"))
+# HARD cap on a foreground execution: after this the kernel is INTERRUPTED and the work
+# dies. 0 (the default) = no hard cap — a long execution keeps running and is detached
+# instead (see SOFT_REPLY_DEADLINE_SEC). The old 120s default predates the soft deadline
+# and now only serves to kill exactly the long jobs this server is meant to host; set it
+# only if you want a real kill switch. A caller-supplied `timeout` still overrides it.
+EXEC_TIMEOUT_SEC = float(_env("EXEC_TIMEOUT_SEC", "0"))
+# SOFT deadline: how long a foreground execute_code/execute_cell may take before the
+# server answers ANYWAY, with {status: "still_running", exec_id}. The work is NOT killed —
+# it detaches and keeps running. This must stay comfortably below the MCP client's own
+# tool-call timeout (Claude clients give up in well under a minute); a client that gives
+# up gets no reply at all, reads it as failure, and resends the code (ADR 0017).
+SOFT_REPLY_DEADLINE_SEC = float(_env("SOFT_REPLY_DEADLINE_SEC", "45"))
 IDLE_TIMEOUT_SEC = float(_env("KERNEL_IDLE_TIMEOUT_SEC", "3600"))
 # Absolute max kernel lifetime (Colab-style hard cap): reap regardless of
 # activity once older than this. 0 disables. Applies even to pinned kernels.

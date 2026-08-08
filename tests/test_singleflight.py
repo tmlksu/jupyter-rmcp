@@ -13,6 +13,7 @@ import asyncio
 
 import pytest
 
+import config
 import jobs
 import notebook
 import state
@@ -45,8 +46,10 @@ class _Kernel:
         self.calls: list[str] = []
         self.reply = reply or {"status": "ok", "execution_count": 1, "outputs": [], "timed_out": False}
 
-    async def run(self, _kernel_id, code, _timeout=None):
+    async def run(self, _kernel_id, code, _timeout=None, sink=None):
         self.calls.append(code)
+        if sink is not None:
+            sink.append({"output_type": "stream", "name": "stdout", "text": "progress...\n"})
         self.started.set()
         await self.gate.wait()
         return self.reply
@@ -84,7 +87,7 @@ class TestBusyRefusal:
         assert busy["running"]["code_head"] == CODE
         assert busy["running"]["elapsed_seconds"] >= 0
         assert busy["running"]["exec_id"].startswith("exec-")
-        assert "get_last_execution" in busy["next_action"]
+        assert "get_execution" in busy["next_action"]
         assert "interrupt_kernel" in busy["next_action"]
         k.gate.set()
         await first
@@ -214,7 +217,7 @@ class TestAbandonedCaller:
         await asyncio.sleep(0.01)
 
         assert state.running_exec("kid-d") is None
-        rec = await jobs.get_last_execution("kid-d")
+        rec = await jobs.get_execution("kid-d")
         assert rec["status"] == "ok"
         assert rec["client_abandoned"] is True
 
@@ -277,9 +280,126 @@ class TestAbandonedCaller:
         assert k.calls == [CODE, CODE]
 
 
+class TestSoftDeadline:
+    """The server must answer before the client stops listening — always (ADR 0018)."""
+
+    @pytest.fixture(autouse=True)
+    def tiny_deadline(self, monkeypatch):
+        monkeypatch.setattr(config, "SOFT_REPLY_DEADLINE_SEC", 0.05)
+
+    async def test_slow_execution_answers_with_still_running(self, monkeypatch, no_notebook):
+        k = _install(monkeypatch, _Kernel())
+
+        r = await jobs.execute_code("kid-sd", CODE)
+
+        assert r["status"] == "still_running"
+        assert r["exec_id"].startswith("exec-")
+        assert "not a failure" in r["note"].lower()
+        assert k.calls == [CODE]      # started, and never interrupted
+        k.gate.set()
+        await asyncio.sleep(0.01)
+
+    async def test_still_running_carries_live_partial_output(self, monkeypatch, no_notebook):
+        k = _install(monkeypatch, _Kernel())
+
+        r = await jobs.execute_code("kid-sd2", CODE)
+
+        assert "progress..." in r["partial_output"]
+        k.gate.set()
+        await asyncio.sleep(0.01)
+
+    async def test_detached_execution_still_holds_the_kernel(self, monkeypatch, no_notebook):
+        k = _install(monkeypatch, _Kernel())
+        await jobs.execute_code("kid-sd3", CODE)
+
+        second = await jobs.execute_code("kid-sd3", CODE)
+
+        assert second["status"] == "busy"
+        assert second["running"]["detached"] is True
+        assert k.calls == [CODE]
+        k.gate.set()
+        await asyncio.sleep(0.01)
+
+    async def test_result_is_collectable_once_it_finishes(self, monkeypatch, no_notebook):
+        k = _install(monkeypatch, _Kernel(reply={
+            "status": "ok", "execution_count": 3, "timed_out": False,
+            "outputs": [{"output_type": "stream", "name": "stdout", "text": "done late\n"}]}))
+        started = await jobs.execute_code("kid-sd4", CODE)
+        k.gate.set()
+
+        r = await jobs.get_execution("kid-sd4", exec_id=started["exec_id"], wait_seconds=5)
+
+        assert r["status"] == "ok"
+        assert "done late" in r["text"]
+        assert r["detached"] is True
+        assert r["client_abandoned"] is False   # we DID answer, so no blind-retry replay
+
+    async def test_long_poll_returns_as_soon_as_it_finishes(self, monkeypatch, no_notebook):
+        k = _install(monkeypatch, _Kernel())
+        await jobs.execute_code("kid-sd5", CODE)
+
+        async def _release_soon():
+            await asyncio.sleep(0.05)
+            k.gate.set()
+        asyncio.ensure_future(_release_soon())
+
+        r = await jobs.get_execution("kid-sd5", wait_seconds=5)
+
+        assert r["status"] == "ok"
+
+    async def test_long_poll_gives_up_without_killing_the_work(self, monkeypatch, no_notebook):
+        k = _install(monkeypatch, _Kernel())
+        await jobs.execute_code("kid-sd6", CODE)
+
+        r = await jobs.get_execution("kid-sd6", wait_seconds=0.05)
+
+        assert r["status"] == "running"
+        assert "progress..." in r["running"]["partial_output"]
+        assert state.running_exec("kid-sd6") is not None   # the poller did not cancel it
+        k.gate.set()
+        await asyncio.sleep(0.01)
+
+    async def test_unknown_exec_id_is_not_confused_with_the_latest(self, monkeypatch, no_notebook):
+        k = _install(monkeypatch, _Kernel())
+        k.gate.set()
+        await jobs.execute_code("kid-sd7", CODE)
+
+        r = await jobs.get_execution("kid-sd7", exec_id="exec-deadbeef")
+
+        assert r["status"] == "unknown"
+
+
+class TestGetJobLongPoll:
+    async def test_waits_for_the_job_to_leave_the_running_state(self, monkeypatch):
+        monkeypatch.setattr(jobs, "_JOB_POLL_INTERVAL_SEC", 0.01)
+        states = ["running_in_background", "running_in_background", "done"]
+
+        async def _poll(_kid, job_id, _offset, _max_chars):
+            return {"kernel_id": "k", "job_id": job_id, "status": states.pop(0), "output": ""}
+        monkeypatch.setattr(jobs, "_poll_job", _poll)
+
+        r = await jobs.get_job("k", "job-1", wait_seconds=5)
+
+        assert r["status"] == "done"
+        assert states == []
+
+    async def test_returns_immediately_without_wait_seconds(self, monkeypatch):
+        polls = []
+
+        async def _poll(_kid, job_id, _offset, _max_chars):
+            polls.append(job_id)
+            return {"kernel_id": "k", "job_id": job_id, "status": "running_in_background"}
+        monkeypatch.setattr(jobs, "_poll_job", _poll)
+
+        r = await jobs.get_job("k", "job-2")
+
+        assert r["status"] == "running_in_background"
+        assert len(polls) == 1
+
+
 class TestGetLastExecution:
     async def test_reports_nothing_for_an_unknown_kernel(self):
-        r = await jobs.get_last_execution("kid-unknown")
+        r = await jobs.get_execution("kid-unknown")
         assert r["status"] == "none"
 
     async def test_reports_a_running_execution_without_touching_the_kernel(
@@ -288,7 +408,7 @@ class TestGetLastExecution:
         first = asyncio.ensure_future(jobs.execute_code("kid-run", CODE))
         await k.started.wait()
 
-        r = await jobs.get_last_execution("kid-run")
+        r = await jobs.get_execution("kid-run")
 
         assert r["status"] == "running"
         assert r["running"]["code_head"] == CODE
@@ -303,7 +423,7 @@ class TestGetLastExecution:
         k.gate.set()
         await jobs.execute_code("kid-last", CODE)
 
-        r = await jobs.get_last_execution("kid-last")
+        r = await jobs.get_execution("kid-last")
 
         assert r["status"] == "ok"
         assert r["execution_count"] == 7
@@ -319,7 +439,7 @@ class TestGetLastExecution:
         k.gate.set()
         await jobs.execute_code("kid-big", CODE)
 
-        r = await jobs.get_last_execution("kid-big", max_chars=500)
+        r = await jobs.get_execution("kid-big", max_chars=500)
 
         assert len(r["text"]) == 500
         assert r["text_truncated"] is True
