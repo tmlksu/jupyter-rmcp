@@ -19,9 +19,12 @@ def _strip_ansi(s: str) -> str:
 
 
 def _cap(text: str) -> str:
-    """Bound one field to MAX_OUTPUT_CHARS so no single output ships unbounded."""
+    """Bound one field to ~MAX_OUTPUT_CHARS, head + tail: the END of a long stream
+    is where the result usually lands ('FINAL accuracy=...'), so a head-only cut
+    drops the very thing the caller was running the code for."""
     if len(text) > MAX_OUTPUT_CHARS:
-        return text[:MAX_OUTPUT_CHARS] + f"\n... [truncated, {len(text)} chars total]"
+        half = MAX_OUTPUT_CHARS // 2
+        return text[:half] + f"\n... [truncated, {len(text)} chars total] ...\n" + text[-half:]
     return text
 
 
