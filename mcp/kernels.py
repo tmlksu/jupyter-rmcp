@@ -139,7 +139,12 @@ async def start_kernel(name: str = "python3", notebook_path: str | None = None,
                 "notebook_path": notebook_path}
 
     if backend == LOCAL and notebook_path:
-        # Local: use a real Jupyter session so JupyterLab shows the binding.
+        # Local: use a real Jupyter session so JupyterLab shows the binding. Capacity
+        # applies here too — this used to be unreachable because notebook_path is
+        # always truthy after _resolve_notebook_path. Deliberate side effect: the
+        # oldest idle UNPINNED kernel is reaped, which can be a human's JupyterLab
+        # kernel or a background job's host kernel (the job process itself survives).
+        await reaper._enforce_capacity()
         session = await local_jupyter._rest_post("/api/sessions", {
             "path": notebook_path,
             "name": notebook_path.rsplit("/", 1)[-1],
