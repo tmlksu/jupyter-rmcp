@@ -180,6 +180,23 @@ class TestBoundedSink:
         assert s[0]["output_type"] == "display_data"
         assert "output elided" in s[0]["data"]["text/plain"]
 
+    def test_marker_entries_are_schema_valid_notebook_outputs(self, monkeypatch):
+        """Markers flow into .ipynb via write-back — nbformat REQUIRES 'metadata' on
+        display_data, so a marker without it would save a notebook Jupyter can't open."""
+        import nbformat
+        monkeypatch.setattr(state, "_SINK_ENTRY_CHARS", 100)
+        monkeypatch.setattr(state, "_SINK_MAX_OUTPUTS", 6)
+        s = state.BoundedSink()
+        s.append({"output_type": "display_data", "metadata": {},
+                  "data": {"image/png": "iVBOR" * 100, "text/plain": "fig"}})
+        for i in range(20):
+            s.append({"output_type": "execute_result", "metadata": {},
+                      "execution_count": 1, "data": {"text/plain": str(i)}})
+        nb = {"cells": [{"cell_type": "code", "metadata": {}, "source": "x = 1",
+                         "id": "cell-1", "execution_count": 1, "outputs": list(s)}],
+              "metadata": {}, "nbformat": 4, "nbformat_minor": 5}
+        nbformat.validate(nbformat.from_dict(nb))   # raises if any output is invalid
+
     def test_flood_stays_under_the_stream_budget(self):
         s = state.BoundedSink()
         for _ in range(200):
@@ -290,9 +307,10 @@ class TestPollJobBusy:
         async def _slow_read(*_a, **_k):
             try:
                 await asyncio.sleep(0.2)    # outlives the 0.05s answer budget
-            finally:
-                ran.append("finished" if not asyncio.current_task().cancelled()
-                           else "cancelled")
+            except asyncio.CancelledError:
+                ran.append("cancelled")
+                raise
+            ran.append("finished")
             return {"status": "ok", "outputs": [], "timed_out": False}
         monkeypatch.setattr(jobs.backends, "_run_on_kernel", _slow_read)
 
