@@ -94,7 +94,9 @@ _INTROSPECT_LOCK_WAIT_SEC = 3.0
 # and everything derived from it — cheap.
 _SINK_STREAM_CHARS = 40000   # head+tail budget per merged stream output
 _SINK_MAX_OUTPUTS = 500      # cap on distinct (non-mergeable) output entries
+_SINK_ENTRY_CHARS = 300000   # cap on one non-stream entry (images can be MBs each)
 _STREAM_ELIDED = "\n... [intermediate stream output elided] ...\n"
+_ENTRIES_ELIDED = "... [intermediate outputs elided] ..."
 
 
 def _bounded_stream_text(text: str) -> str:
@@ -105,12 +107,26 @@ def _bounded_stream_text(text: str) -> str:
     return text[:half] + _STREAM_ELIDED + text[-half:]
 
 
+def _entry_size(output: dict[str, Any]) -> int:
+    """Rough text size of one non-stream output — what the per-entry cap measures."""
+    if output.get("output_type") == "error":
+        return sum(len(t) for t in output.get("traceback", []))
+    return sum(len(v) for v in (output.get("data") or {}).values() if isinstance(v, str))
+
+
+def _entries_elided_entry() -> dict[str, Any]:
+    """A display_data marker: never merges into a stream, shows up in text + structured."""
+    return {"output_type": "display_data", "data": {"text/plain": _ENTRIES_ELIDED}}
+
+
 class BoundedSink(list):
     """The live output buffer for a running execution.
 
     Consecutive outputs on the same stream MERGE into one entry whose text keeps a
-    head+tail char budget; the entry count is capped too (middle entries drop first —
-    head and tail are the informative ends). Behaves like a list otherwise: the
+    head+tail char budget; non-stream entries are individually capped (one giant
+    image would otherwise dominate the whole budget); the entry count is capped too
+    (middle entries drop first — head and tail are the informative ends — and a
+    marker entry records the loss). Behaves like a list otherwise: the
     jupyter-kernel-client output_hook appends to it, and it is the notebook
     write-back's output list."""
 
@@ -126,8 +142,19 @@ class BoundedSink(list):
                                 if sep else _bounded_stream_text(head + new))
                 return
             output = {**output, "text": _bounded_stream_text(new)}
+        else:
+            size = _entry_size(output)
+            if size > _SINK_ENTRY_CHARS:
+                output = {"output_type": "display_data", "data": {"text/plain":
+                          f"... [output elided: {output.get('output_type')} is "
+                          f"{size} chars, over the {_SINK_ENTRY_CHARS} budget] ..."}}
         if len(self) >= _SINK_MAX_OUTPUTS:
-            del self[len(self) // 2]
+            mid = len(self) // 2
+            if (self[mid - 1].get("data") or {}).get("text/plain") == _ENTRIES_ELIDED:
+                del self[mid]                    # the loss is already marked
+            else:
+                # Two entries become one marker: count stays capped AND the drop is visible.
+                self[mid - 1:mid + 1] = [_entries_elided_entry()]
         super().append(output)
 
 
