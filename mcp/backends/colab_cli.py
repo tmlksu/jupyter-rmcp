@@ -248,8 +248,15 @@ async def _heartbeat_colab(kid: str, now) -> None:
     """Ping a colab session with a no-op exec to reset Colab's idle timer (see
     COLAB_HEARTBEAT_SEC). If the ping's result classifies as a definitive loss, drop the
     session; a mere transient failure LEAVES IT LIVE (a hiccup is not a death). Shares the
-    per-session lock so it never races a user exec."""
+    per-session lock so it never races a user exec.
+
+    Skipped while the lock is HELD: a running exec already keeps the VM busy (and its
+    completion touches the heartbeat), while the lock wait — exec_colab can hold it up
+    to a day — would block the entire sequential reaper, freezing max-age enforcement
+    for every backend."""
     lock = state._locks.setdefault(kid, asyncio.Lock())
+    if lock.locked():
+        return
     async with lock:
         rc, out = await _colab_cli("exec", "-s", kid, "--timeout", "20", input_text="0\n", timeout=45)
     state._registry.touch_heartbeat(kid, now)
