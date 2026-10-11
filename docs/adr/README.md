@@ -26,3 +26,5 @@ New ADR: copy the shape of an existing one, next number, add a row below.
 | [0016](0016-scripted-cfzt-setup.md) | Scripted Cloudflare Zero Trust setup: build the gate before the door | Accepted |
 | [0017](0017-single-flight-execution.md) | Single-flight execution: refuse the retry, keep the result | Accepted |
 | [0018](0018-soft-reply-deadline.md) | Answer before the client gives up: soft deadline, detach, never interrupt | Accepted |
+| [0019](0019-mcp-origin-guard.md) | Validate Origin on /mcp; keep Host validation opt-in | Accepted |
+| [0020](0020-jupyter-xsrf-origin.md) | Restore XSRF + Origin checks on the Jupyter server | Accepted |
