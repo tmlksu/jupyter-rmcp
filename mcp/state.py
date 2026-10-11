@@ -115,8 +115,11 @@ def _entry_size(output: dict[str, Any]) -> int:
 
 
 def _entries_elided_entry() -> dict[str, Any]:
-    """A display_data marker: never merges into a stream, shows up in text + structured."""
-    return {"output_type": "display_data", "data": {"text/plain": _ENTRIES_ELIDED}}
+    """A display_data marker: never merges into a stream, shows up in text + structured.
+    `metadata` is REQUIRED by the nbformat schema — the sink becomes a notebook cell's
+    outputs on write-back, and a missing key saves an invalid .ipynb."""
+    return {"output_type": "display_data", "metadata": {},
+            "data": {"text/plain": _ENTRIES_ELIDED}}
 
 
 class BoundedSink(list):
@@ -145,7 +148,8 @@ class BoundedSink(list):
         else:
             size = _entry_size(output)
             if size > _SINK_ENTRY_CHARS:
-                output = {"output_type": "display_data", "data": {"text/plain":
+                output = {"output_type": "display_data", "metadata": {},
+                          "data": {"text/plain":
                           f"... [output elided: {output.get('output_type')} is "
                           f"{size} chars, over the {_SINK_ENTRY_CHARS} budget] ..."}}
         if len(self) >= _SINK_MAX_OUTPUTS:
