@@ -75,8 +75,20 @@ async def _write_back(kernel_id: str, code: str, reply: dict[str, Any],
 
 async def _execute_background(kernel_id: str, code: str) -> dict[str, Any]:
     job_id = "job-" + uuid.uuid4().hex[:8]
-    reply = await backends._run_on_kernel(kernel_id, _job_launch_code(job_id, code), timeout=60)
+    # Same no-interrupt rule as the job poll: the launch is a tiny kernel exec, and a
+    # hard cap here could interrupt a human's cell it queued behind. timeout=0 means
+    # never cap; the colab value only bounds the reply wait (it never kills), so it stays.
+    cli = backends.is_cli(state._backend_of(kernel_id))
+    reply = await backends._run_on_kernel(
+        kernel_id, _job_launch_code(job_id, code), timeout=60 if cli else 0,
+        acquire_timeout=state._INTROSPECT_LOCK_WAIT_SEC)
     result = backends._reply_result(reply)
+    if result.get("status") == "kernel_busy":
+        result["note"] = (
+            f"background job did NOT start — kernel '{kernel_id}' is busy with another "
+            "execution and the launch could not wait for it. NOTHING was interrupted. "
+            "Collect a running execution with get_execution first, or simply retry.")
+        return result
     # Only claim the job started if the LAUNCH exec actually succeeded. Otherwise (session
     # lost, error, timeout) surface that — never hand back a running_in_background/job_id for
     # a job that was never spawned (that produced the "get_job stuck at unknown forever" bug).
@@ -116,7 +128,9 @@ async def execute_code(kernel_id: str, code: str, timeout: float | None = None,
     **append** it as a new cell to the bound notebook (if any). For iterating on an
     EXISTING cell without duplicating it, use execute_cell / edit_cell instead. Works for
     local and colab backends. `timeout` (optional) is a HARD cap: exceeding it INTERRUPTS
-    the kernel. Leave it unset for long work — see below; nothing is interrupted then.
+    the kernel. An explicit `timeout=0` means NEVER interrupt — it forces no cap even when
+    the server default is a hard one. For long work pass 0 (or rely on a 0 server default —
+    see below); nothing is interrupted then.
 
     Foreground calls run through IPython, so `!shell` and `%magic` (e.g. `!pip install …`)
     DO work here. (Background jobs do NOT — see below.)
@@ -274,6 +288,42 @@ async def get_job(kernel_id: str, job_id: str, offset: int | None = None,
 
 
 _JOB_POLL_INTERVAL_SEC = 5.0
+# Bound on the poll EXEC itself — LOCAL only: the race it guards (a human's cell
+# starting after the busy check and queueing our read on the kernel) doesn't exist
+# on colab, where the race IS the session lock (already bounded by acquire_timeout)
+# and a poll legitimately takes >5s (auth + VM round trip). Bounding colab would
+# report kernel_busy wrongly AND strand the lock. The wait does NOT cancel — a
+# queued read still completes on the kernel; we just stop waiting for it.
+_POLL_EXEC_WAIT_SEC = 5.0
+
+
+def _job_poll_code(job_id: str, offset: int | None, mx: int) -> str:
+    """The in-kernel job-status snippet: reads ONLY the requested window of the .out
+    file (seek + bounded read, never the whole file — a chatty job's log can be GBs).
+    The .status file is tiny so a full read is fine."""
+    off_lit = "None" if offset is None else str(int(offset))
+    return (
+        "import pathlib as _pl, json as _json\n"
+        f"_d=_pl.Path({_JOBS_DIR!r})\n"
+        f"_s=_d/({job_id!r}+'.status'); _o=_d/({job_id!r}+'.out')\n"
+        "_st=_s.read_text().strip() if _s.exists() else 'unknown'\n"
+        f"_off={off_lit}; _mx={mx}\n"
+        "_tot=_o.stat().st_size if _o.exists() else 0\n"
+        "_start=max(0,_tot-_mx) if _off is None else max(0,min(int(_off),_tot))\n"
+        "_b=b''\n"
+        "if _start<_tot:\n"
+        "    with open(_o,'rb') as _f:\n"
+        "        _f.seek(_start); _b=_f.read(_mx)\n"
+        "_nx=_start+len(_b)\n"
+        "print(_json.dumps({'status':_st,'total':_tot,'start':_start,'next':_nx,"
+        "'more':_nx<_tot,'output':_b.decode('utf-8','replace')}))\n"
+    )
+
+
+def _job_busy(kernel_id: str, job_id: str, note: str,
+              running: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {"kernel_id": kernel_id, "job_id": job_id, "status": "kernel_busy",
+            "output": "", "running": running, "note": note}
 
 
 async def _poll_job(kernel_id: str, job_id: str, offset: int | None,
@@ -283,40 +333,67 @@ async def _poll_job(kernel_id: str, job_id: str, offset: int | None,
     # now, and here's why" beats the no-reply this whole design exists to eliminate.
     blocked = state.running_exec(kernel_id)
     if blocked is not None:
-        return {"kernel_id": kernel_id, "job_id": job_id, "status": "kernel_busy",
-                "output": "", "running": blocked,
-                "note": (f"could NOT read the job: kernel '{kernel_id}' is busy with a "
-                         f"foreground execution ({blocked['exec_id']}, running "
-                         f"{blocked['elapsed_seconds']:.0f}s), and reading job files needs the "
-                         "kernel. The JOB itself is unaffected — it runs in its own process. "
-                         "Collect the foreground execution first with "
-                         f"get_execution('{kernel_id}', wait_seconds=20), then poll again.")}
-    off_lit = "None" if offset is None else str(int(offset))
+        return _job_busy(kernel_id, job_id, running=blocked, note=(
+            f"could NOT read the job: kernel '{kernel_id}' is busy with a "
+            f"foreground execution ({blocked['exec_id']}, running "
+            f"{blocked['elapsed_seconds']:.0f}s), and reading job files needs the "
+            "kernel. The JOB itself is unaffected — it runs in its own process. "
+            "Collect the foreground execution first with "
+            f"get_execution('{kernel_id}', wait_seconds=20), then poll again."))
+    cli = backends.is_cli(state._backend_of(kernel_id))
+    # Out-of-band work (a human's JupyterLab cell) never appears in running_exec —
+    # catch it via the kernel's real execution_state before queueing behind it.
+    if not cli and await local_jupyter._kernel_busy_oob(kernel_id):
+        return _job_busy(kernel_id, job_id, note=(
+            f"could NOT read the job: kernel '{kernel_id}' is busy executing something "
+            "that did NOT come through this server — usually a JupyterLab cell, though a "
+            "transient kernel request (completions, kernel_info) can also report busy — "
+            "and reading job files needs the kernel. The JOB itself is unaffected — it "
+            "runs in its own process. Retry once the kernel goes idle."))
     mx = max(256, int(max_chars))
-    poll = (
-        "import pathlib as _pl, json as _json\n"
-        f"_d=_pl.Path({_JOBS_DIR!r})\n"
-        f"_s=_d/({job_id!r}+'.status'); _o=_d/({job_id!r}+'.out')\n"
-        "_st=_s.read_text().strip() if _s.exists() else 'unknown'\n"
-        "_b=_o.read_bytes() if _o.exists() else b''\n"
-        "_tot=len(_b)\n"
-        f"_off={off_lit}; _mx={mx}\n"
-        "if _off is None:\n"
-        "    _chunk=_b[-_mx:]; _start=_tot-len(_chunk)\n"
-        "else:\n"
-        "    _off=max(0,min(int(_off),_tot)); _chunk=_b[_off:_off+_mx]; _start=_off\n"
-        "_nx=_start+len(_chunk)\n"
-        "print(_json.dumps({'status':_st,'total':_tot,'start':_start,'next':_nx,"
-        "'more':_nx<_tot,'output':_chunk.decode('utf-8','replace')}))\n"
-    )
     try:
-        reply = await backends._run_on_kernel(kernel_id, poll, timeout=60)
+        # Introspection must NEVER interrupt (ADR 0018): a `timeout` here used to be a
+        # hard cap that INTERRUPTED the kernel — a poll arriving while a human's cell ran
+        # would queue, then kill that cell at the cap. timeout=0 = no cap, and the bounded
+        # lock acquire is what keeps the answer prompt. On colab the timeout only bounds
+        # the reply wait (never kills), so it stays.
+        coro = backends._run_on_kernel(
+            kernel_id, _job_poll_code(job_id, offset, mx), timeout=60 if cli else 0,
+            acquire_timeout=state._INTROSPECT_LOCK_WAIT_SEC)
+        if cli:
+            # No extra bound: a colab poll legitimately takes >5s, its own 60s bounds
+            # the wait, and an abandoned exec would strand the session lock for the
+            # NEXT poll — stuck answering busy.
+            reply = await coro
+        else:
+            task = asyncio.ensure_future(coro)
+            done, _ = await asyncio.wait({task}, timeout=_POLL_EXEC_WAIT_SEC)
+            reply = task.result() if done else None
     except RuntimeError as e:
         # routing guard fired: the (colab) session is already gone
         if "no longer alive" in str(e) or "not found" in str(e):
             return {"kernel_id": kernel_id, "job_id": job_id, "status": "session_lost",
                     "output": "", "note": str(e)}
         raise
+    if reply is None:
+        # The kernel went busy BETWEEN the check above and our read reaching it (a cell
+        # queued ahead). The read still completes on its own — consume the task so an
+        # exception doesn't surface as "never retrieved"; nothing was interrupted.
+        task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
+        return _job_busy(kernel_id, job_id, note=(
+            f"could NOT read the job within {_POLL_EXEC_WAIT_SEC:.0f}s: kernel "
+            f"'{kernel_id}' went busy between the check and the read (e.g. a JupyterLab "
+            "cell started just now) and the read is queued behind it — it completes on "
+            "its own, NOTHING was interrupted. The JOB itself is unaffected — it runs "
+            "in its own process. Retry the poll."))
+    if reply.get("status") == "kernel_busy":
+        # The lock wait expired — another exec holds the kernel (one still starting,
+        # or out-of-band work that began after the check above). Same answer either way.
+        return _job_busy(kernel_id, job_id, note=(
+            f"could NOT read the job: kernel '{kernel_id}' is busy with another "
+            "execution and the wait budget ran out. The JOB itself is unaffected — it "
+            "runs in its own process. Retry the poll; collect a foreground execution "
+            f"first with get_execution('{kernel_id}', wait_seconds=20) if one is running."))
     if reply.get("status") == "session_lost":
         return {"kernel_id": kernel_id, "job_id": job_id, "status": "session_lost",
                 "output": "", "note": reply.get("note",

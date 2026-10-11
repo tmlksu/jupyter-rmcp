@@ -143,7 +143,9 @@ All three knobs (`KERNEL_MAX_AGE_SEC`, `KERNEL_IDLE_TIMEOUT_SEC`,
 ## Capacity
 `MAX_KERNELS` caps concurrent kernels. On `start` at cap: reap the oldest idle
 kernel if any, else return a clear error. Prevents a phone tap from exhausting
-the VPS.
+the VPS. The reaped kernel's execution bookkeeping goes with it (`forget_exec`),
+so a finished-but-uncollected detached result on that kernel can be lost —
+unlikely, since the oldest-activity kernel is chosen first.
 
 ## Notebook persistence (implemented)
 Two independent lifetimes — don't conflate them:

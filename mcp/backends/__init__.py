@@ -89,18 +89,24 @@ async def _resolve_backend(kernel_id: str) -> str:
 
 
 async def _run_on_kernel(kernel_id: str, code: str, timeout: float | None = None,
-                         output_sink: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                         output_sink: list[dict[str, Any]] | None = None,
+                         acquire_timeout: float | None = None) -> dict[str, Any]:
     """Execute code on a kernel (any backend); return a normalized reply
     {status, execution_count, outputs(nbformat), timed_out}. No notebook write-back.
     Routing is explicit (unknown id raises — never a silent LOCAL fallback).
 
     `output_sink`, when given, is filled with outputs AS THEY ARRIVE so a detached
     execution can report live progress. Only the local backend can do that; colab-cli
-    hands its output back in one piece at the end, so the sink stays empty there."""
+    hands its output back in one piece at the end, so the sink stays empty there.
+    `acquire_timeout` bounds the wait on the per-kernel execution lock — on expiry the
+    reply is status="kernel_busy" and NOTHING was sent (introspection callers that must
+    answer rather than queue behind a day-long execution)."""
     backend = await _resolve_backend(kernel_id)
     if is_cli(backend):
-        return await colab_cli.exec_colab(kernel_id, code, timeout)
-    return await local_jupyter.exec_local(kernel_id, backend, code, timeout, output_sink)
+        return await colab_cli.exec_colab(kernel_id, code, timeout,
+                                          acquire_timeout=acquire_timeout)
+    return await local_jupyter.exec_local(kernel_id, backend, code, timeout, output_sink,
+                                          acquire_timeout=acquire_timeout)
 
 
 def _reply_result(reply: dict[str, Any]) -> dict[str, Any]:
@@ -130,6 +136,7 @@ async def _delete_kernel(kernel_id: str, backend: str | None = None) -> None:
         if r.status_code not in (204, 404):
             r.raise_for_status()
     state._registry.forget(kernel_id)
+    state._locks.pop(kernel_id, None)   # a dead kernel keeps no execution lock
     state.forget_exec(kernel_id)   # a dead kernel has no in-flight and no result worth keeping
 
 

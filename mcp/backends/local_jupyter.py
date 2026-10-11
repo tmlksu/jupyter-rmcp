@@ -272,6 +272,26 @@ async def _kernel_is_running(kernel_id: str, backend: str) -> bool:
         return True
 
 
+# A hung Jupyter must not make this check outlast the soft reply deadline (the shared
+# client waits 30s before the caller's own lookup would even start).
+_OOB_CHECK_TIMEOUT_SEC = 5.0
+
+
+async def _kernel_busy_oob(kernel_id: str, backend: str = LOCAL) -> bool:
+    """Is this kernel executing something NOT launched through this server (a human's
+    JupyterLab cell — though transient kernel requests like completions/kernel_info
+    report busy too)? running_exec can't see out-of-band work, but /api/kernels can.
+    A lookup failure answers False — the caller's own request surfaces the real error
+    rather than a misleading 'busy'."""
+    try:
+        r = await _http(backend).get("/api/kernels", timeout=_OOB_CHECK_TIMEOUT_SEC)
+        r.raise_for_status()
+        return any(k.get("id") == kernel_id and k.get("execution_state") == "busy"
+                   for k in r.json())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def _await_uncapped(task: asyncio.Future, kernel_id: str, backend: str) -> dict[str, Any]:
     """Wait for an execution with no hard cap — but notice if the kernel stops running it.
 
@@ -304,23 +324,36 @@ async def _await_uncapped(task: asyncio.Future, kernel_id: str, backend: str) ->
 
 # ---- local execution (the jupyter branch of the old _run_on_kernel) ---------
 async def exec_local(kernel_id: str, backend: str, code: str, timeout: float | None = None,
-                     output_sink: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                     output_sink: list[dict[str, Any]] | None = None,
+                     acquire_timeout: float | None = None) -> dict[str, Any]:
     """Execute code on a LOCAL Jupyter kernel; return a normalized reply
     {status, execution_count, outputs(nbformat), timed_out}. No notebook write-back.
 
-    `timeout` (or EXEC_TIMEOUT_SEC when it is set) is a HARD cap: it INTERRUPTS the kernel.
-    With neither set there is no cap and nothing is interrupted — a long execution is meant
-    to be detached and polled, not killed (ADR 0018). `output_sink` receives outputs as
-    they arrive so a detached execution can show live progress."""
+    `timeout` (or EXEC_TIMEOUT_SEC when it is None) is a HARD cap: it INTERRUPTS the kernel.
+    An explicit 0 means NO cap ever — the introspection callers use that because they must
+    never interrupt work (ADR 0018). With no cap nothing is interrupted — a long execution
+    is meant to be detached and polled, not killed. `acquire_timeout` bounds the wait on
+    the per-kernel lock: on expiry the reply is status="kernel_busy" — used by
+    introspection execs that must answer promptly rather than queue behind a running one.
+    `output_sink` receives outputs as they arrive so a detached execution can show live
+    progress."""
     # Verify the kernel actually exists before attaching, so we never auto-create or
     # attach to a phantom (a stopped/reaped id must fail cleanly, not mis-route).
     if not any(k.get("id") == kernel_id for k in await _kernels(backend)):
         raise RuntimeError(f"kernel '{kernel_id}' not found on backend '{backend}' — it was stopped "
                            "or reaped. Start a new kernel with start_kernel().")
-    to = float(timeout) if timeout else EXEC_TIMEOUT_SEC
-    sink = output_sink if output_sink is not None else []
+    to = float(timeout) if timeout is not None else EXEC_TIMEOUT_SEC
+    sink = output_sink if output_sink is not None else state.BoundedSink()
     lock = state._locks.setdefault(kernel_id, asyncio.Lock())
-    async with lock:
+    try:
+        await asyncio.wait_for(lock.acquire(), acquire_timeout)
+    except TimeoutError:
+        # Another exec holds this kernel's lock and outlasted the caller's patience.
+        # Introspection reports busy instead of queueing — a kernel exec behind a
+        # day-long run is the no-reply pattern ADR 0018 exists to remove.
+        return {"status": "kernel_busy", "execution_count": None, "outputs": [],
+                "timed_out": False}
+    try:
         kc = await _get_client(kernel_id)
         # jupyter_client's `timeout` does NOT bound total run time; enforce it here.
         # The worker thread can't be cancelled, so shield it, interrupt on timeout,
@@ -361,5 +394,7 @@ async def exec_local(kernel_id: str, backend: str, code: str, timeout: float | N
         except Exception as e:  # noqa: BLE001
             await _drop_client(kernel_id)
             raise RuntimeError(f"execution failed: {e}") from e
+    finally:
+        lock.release()
     reply["timed_out"] = False
     return reply

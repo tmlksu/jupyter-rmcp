@@ -61,6 +61,10 @@ public release — earlier history is the private development of the same code.
   at which you get a reply. **Upgrade note:** an existing `.env` pinning
   `EXEC_TIMEOUT_SEC=120` keeps interrupting long executions at two minutes — set
   it to `0` to get the detach-and-keep-running behavior.
+- **An explicit `timeout=0` now means "never interrupt", not "server default".**
+  It used to fall through to `EXEC_TIMEOUT_SEC` like an omitted argument; it now
+  forces no cap even when the server default is a hard one. Omitting `timeout`
+  still means the server default.
 
 ### Fixed
 - **A long execution no longer runs twice when the client gives up on it.** MCP
@@ -87,6 +91,71 @@ public release — earlier history is the private development of the same code.
   interrupting the kernel, and now defaults to `0` (no cap). A `timeout` you pass
   yourself still interrupts. See
   [ADR 0018](docs/adr/0018-soft-reply-deadline.md).
+
+- **The `/mcp` endpoint now validates Origin headers (DNS-rebinding fix).**
+  `allowed_hosts=["*"]`/`allowed_origins=["*"]` never took effect — FastMCP's
+  Host/Origin guard only exists when `host_origin_protection` is set, so every
+  request reached MCP unexamined. The guard is now on (`"auto"`): a request
+  carrying an `Origin` is rejected with 403 unless the origin is in the new
+  `MCP_ALLOWED_ORIGINS` env allowlist or **both** Origin and Host are loopback;
+  requests with no `Origin` header (every non-browser MCP client) pass through.
+  Host allowlisting stays opt-in via `MCP_ALLOWED_HOSTS` — a tunnel/proxy
+  forwards the public Host header, so pinning hosts by default would 421 every
+  proxied deployment. See [ADR 0019](docs/adr/0019-mcp-origin-guard.md).
+
+- **`get_job`/`list_variables` can no longer kill someone else's cell.** The
+  job poll ran its read with a 60 s *interrupting* timeout: arriving while a
+  human's JupyterLab cell ran (invisible to the server's own bookkeeping), it
+  queued, outlasted the reply deadline, then **interrupted the human's cell** —
+  the exact invariant ADR 0018 exists to keep. Introspection now checks the
+  kernel's real `execution_state` for out-of-band work, waits on the per-kernel
+  lock for at most a few seconds, and answers `status: "kernel_busy"` — never
+  interrupting. A cell that starts *between* the check and the read can't stall
+  the poll either: the wait is bounded (and never cancels the queued read).
+  `list_variables` also explicitly refuses non-local backends instead of
+  crashing with a `KeyError` on colab kernels, and the background-job **launch**
+  exec follows the same no-interrupt rule.
+
+- **`MAX_KERNELS` capacity enforcement actually runs now.** `start_kernel`'s
+  sessions path (every normal start) returned before the capacity check, making
+  it dead code — local kernel creation was effectively uncapped until the
+  container's memory limit killed something. `_enforce_capacity` now runs before
+  session creation too, and may reap the oldest idle unpinned kernel — including
+  a human's idle JupyterLab kernel or a background job's host kernel (the job
+  process itself survives), which is what DESIGN.md always intended.
+
+- **Execution output buffers are bounded.** `while True: print(...)` used to grow
+  the live output sink (and every poll that re-formatted it) without limit, and
+  each structured `outputs[i].text` shipped to the client uncapped — one big
+  `print` could swamp an agent's context. Consecutive same-stream outputs now
+  merge into one entry that keeps a head+tail char budget (with an elision
+  marker), non-stream entries are individually capped (a marker replaces one
+  giant image), the entry count is capped (dropped middle entries leave an
+  elision marker), and every per-output text field is capped head+tail — so the
+  *end* of a stream, where the result usually lands, is never cut away.
+
+- **The colab keep-alive heartbeat no longer stalls the whole reaper.** It
+  waited on the per-session lock with no timeout while a `colab exec` can hold it
+  for up to a day — freezing max-age enforcement for *all* backends behind one
+  long GPU job. A held lock now skips the ping (a running exec already keeps the
+  VM awake); the reaper stays sequential.
+
+- **`get_job` polls a window of the output file, not the whole file.** The
+  in-kernel snippet read the entire `.out` on every poll — O(file) per call for
+  exactly the chatty long jobs this feature hosts. It now seeks and reads only
+  the requested window.
+
+- **Jupyter Server keeps its XSRF and Origin checks on** (`disable_check_xsrf`
+  and `allow_origin="*"` removed from `jupyter/jupyter_server_config.py`). The
+  stale "private network" comment predated ADR 0012, which publishes JupyterLab
+  behind an authenticating proxy; the MCP is unaffected — it authenticates with
+  the token header and sends no `Origin`. See
+  [ADR 0020](docs/adr/0020-jupyter-xsrf-origin.md).
+
+- **Small hardening:** the per-kernel execution lock is dropped when a kernel is
+  deleted (slow leak proportional to kernel churn), and `/health` no longer
+  returns the raw exception string — it embedded the internal `JUPYTER_URL` —
+  reporting a sanitized `unreachable` instead (the detail is still logged).
 
 ## [1.0.0] — 2026-07-22
 

@@ -48,6 +48,22 @@ if not JUPYTER_TOKEN:
         "`python3 -c 'import secrets; print(secrets.token_hex(32))'` and set it in .env.")
 MCP_BEARER = _env("MCP_BEARER", "")
 MCP_PORT = int(_env("MCP_PORT", "8000"))
+
+
+def _env_list(name: str) -> list[str]:
+    """Comma-separated env var -> list (empty/unset -> [])."""
+    return [v for v in (s.strip() for s in os.environ.get(name, "").split(",")) if v]
+
+
+# Origin allowlist for the /mcp Host/Origin guard (ADR 0019). A request carrying an
+# Origin header is accepted only when the origin is listed here, or when Origin and
+# Host are BOTH loopback — anything else gets 403 before reaching MCP. Non-browser
+# MCP clients send no Origin and pass through either way.
+MCP_ALLOWED_ORIGINS = _env_list("MCP_ALLOWED_ORIGINS")
+# Opt-in Host allowlist, EMPTY on purpose: a tunnel/proxy in front (the documented
+# deployment) forwards the public Host header, and pinning hosts would 421 every
+# proxied request. Set only when serving /mcp to browsers without a tunnel.
+MCP_ALLOWED_HOSTS = _env_list("MCP_ALLOWED_HOSTS")
 # HARD cap on a foreground execution: after this the kernel is INTERRUPTED and the work
 # dies. 0 (the default) = no hard cap — a long execution keeps running and is detached
 # instead (see SOFT_REPLY_DEADLINE_SEC). The old 120s default predates the soft deadline

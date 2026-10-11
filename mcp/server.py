@@ -41,7 +41,10 @@ async def _health(_request: Request) -> JSONResponse:
         await local_jupyter._http(LOCAL).get("/api")
         backend = "ok"
     except Exception as e:  # noqa: BLE001
-        backend = f"unreachable: {e}"
+        # Sanitized: the exception string embeds the internal JUPYTER_URL, and this
+        # route deliberately answers WITHOUT auth (smoke_test depends on that).
+        log.warning("health: local jupyter unreachable: %s", e)
+        backend = "unreachable"
     # The execution-policy fields are reported so a checker can assert the DEPLOYED values
     # (the smoke test times a slow execution against the real soft deadline, and a stale
     # EXEC_TIMEOUT_SEC silently reintroduces the interrupt this server no longer wants).
@@ -50,7 +53,24 @@ async def _health(_request: Request) -> JSONResponse:
                          "exec_hard_timeout_sec": config.EXEC_TIMEOUT_SEC})
 
 
-app = mcp.http_app(path="/mcp", stateless_http=True, allowed_hosts=["*"], allowed_origins=["*"])
+# DNS-rebinding/Origin guard (ADR 0019): FastMCP's guard is OFF unless
+# host_origin_protection is set — the old allowed_hosts=["*"]/allowed_origins=["*"]
+# never did anything. "auto" + an explicit (possibly empty) origins list validates
+# every request carrying an Origin: allowlisted, or Origin+Host both loopback;
+# requests without an Origin header (every non-browser MCP client) pass through.
+# allowed_hosts stays None unless MCP_ALLOWED_HOSTS is set — an empty-but-explicit
+# list would flip host validation ON and 421 every tunnel-proxied request.
+def _build_app():
+    """The HTTP app, parameterized by config NOW — tests rebuild it with a patched
+    allowlist rather than duplicating these exact arguments."""
+    return mcp.http_app(
+        path="/mcp", stateless_http=True, host_origin_protection="auto",
+        allowed_hosts=config.MCP_ALLOWED_HOSTS or None,
+        allowed_origins=list(config.MCP_ALLOWED_ORIGINS),
+    )
+
+
+app = _build_app()
 
 
 def _check_colab_only() -> None:

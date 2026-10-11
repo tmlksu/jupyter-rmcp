@@ -47,7 +47,7 @@ class _Kernel:
         self.calls: list[str] = []
         self.reply = reply or {"status": "ok", "execution_count": 1, "outputs": [], "timed_out": False}
 
-    async def run(self, _kernel_id, code, timeout=None, sink=None):
+    async def run(self, _kernel_id, code, timeout=None, sink=None, acquire_timeout=None):
         self.calls.append(code)
         if sink is not None:
             sink.append({"output_type": "stream", "name": "stdout", "text": "progress...\n"})

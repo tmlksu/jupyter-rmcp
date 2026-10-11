@@ -51,6 +51,40 @@ class TestFormatOutputs:
     def test_truncation_at_max_output_chars(self):
         big = "x" * (config.MAX_OUTPUT_CHARS + 5000)
         _, text = outputs._format_outputs([{"output_type": "stream", "name": "stdout", "text": big}])
-        assert text.startswith("x" * config.MAX_OUTPUT_CHARS)
-        assert text.endswith(f"[truncated, {len(big)} chars total]")
+        half = config.MAX_OUTPUT_CHARS // 2
+        # head + tail: the cap keeps BOTH ends, not just the head — the tail is
+        # where a long run's result lands.
+        assert text.startswith("x" * half)
+        assert text.endswith("x" * half)
+        assert f"[truncated, {len(big)} chars total]" in text
         assert len(text) < len(big)
+
+    def test_each_structured_output_text_is_capped(self):
+        # MAX_OUTPUT_CHARS used to bound only the combined text — a single output
+        # (colab wraps ALL stdout into one) still shipped unbounded to the client.
+        big = "y" * (config.MAX_OUTPUT_CHARS + 5000)
+        structured, _ = outputs._format_outputs(
+            [{"output_type": "stream", "name": "stdout", "text": big}])
+        assert f"[truncated, {len(big)} chars total]" in structured[0]["text"]
+        assert len(structured[0]["text"]) < len(big)
+
+    def test_cap_keeps_the_tail_of_a_merged_sink(self):
+        # #10 regression: the sink merges flood output into a head+tail entry, but a
+        # head-only _cap then threw the tail (and 'FINAL') away anyway. Simulate the
+        # real flood: 3000 progress lines + the result line, through the sink itself.
+        import state
+        sink = state.BoundedSink()
+        for i in range(3000):
+            sink.append({"output_type": "stream", "name": "stdout",
+                         "text": f"epoch {i} done\n"})
+        sink.append({"output_type": "stream", "name": "stdout",
+                     "text": "FINAL accuracy=0.93\n"})
+        structured, text = outputs._format_outputs(list(sink))
+        assert "FINAL accuracy=0.93" in structured[0]["text"]
+        assert "FINAL accuracy=0.93" in text
+
+    def test_execute_result_text_is_capped(self):
+        big = "z" * (config.MAX_OUTPUT_CHARS + 100)
+        structured, _ = outputs._format_outputs(
+            [{"output_type": "execute_result", "data": {"text/plain": big}}])
+        assert "truncated" in structured[0]["text"]
