@@ -272,14 +272,22 @@ async def _kernel_is_running(kernel_id: str, backend: str) -> bool:
         return True
 
 
+# A hung Jupyter must not make this check outlast the soft reply deadline (the shared
+# client waits 30s before the caller's own lookup would even start).
+_OOB_CHECK_TIMEOUT_SEC = 5.0
+
+
 async def _kernel_busy_oob(kernel_id: str, backend: str = LOCAL) -> bool:
     """Is this kernel executing something NOT launched through this server (a human's
-    JupyterLab cell)? running_exec can't see out-of-band work, but /api/kernels can.
+    JupyterLab cell — though transient kernel requests like completions/kernel_info
+    report busy too)? running_exec can't see out-of-band work, but /api/kernels can.
     A lookup failure answers False — the caller's own request surfaces the real error
     rather than a misleading 'busy'."""
     try:
+        r = await _http(backend).get("/api/kernels", timeout=_OOB_CHECK_TIMEOUT_SEC)
+        r.raise_for_status()
         return any(k.get("id") == kernel_id and k.get("execution_state") == "busy"
-                   for k in await _kernels(backend))
+                   for k in r.json())
     except Exception:  # noqa: BLE001
         return False
 

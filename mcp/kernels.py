@@ -322,10 +322,12 @@ async def list_variables(kernel_id: str) -> Any:
     # Out-of-band work (a human's JupyterLab cell) never appears in running_exec.
     if await local_jupyter._kernel_busy_oob(kernel_id):
         return {"kernel_id": kernel_id, "status": "kernel_busy", "running": None,
-                "note": (f"kernel '{kernel_id}' is busy executing code that did NOT come "
-                         "through this server (e.g. a JupyterLab cell); listing variables "
-                         "needs the kernel, so it was refused rather than left to queue "
-                         "behind it. Retry once that execution finishes.")}
+                "note": (f"kernel '{kernel_id}' is busy executing something that did NOT "
+                         "come through this server — usually a JupyterLab cell, though a "
+                         "transient kernel request (completions, kernel_info) can also "
+                         "report busy; listing variables needs the kernel, so it was "
+                         "refused rather than left to queue behind it. Retry once the "
+                         "kernel goes idle.")}
     lock = state._locks.setdefault(kernel_id, asyncio.Lock())
     try:
         await asyncio.wait_for(lock.acquire(), state._INTROSPECT_LOCK_WAIT_SEC)
