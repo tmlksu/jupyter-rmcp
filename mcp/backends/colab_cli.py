@@ -272,12 +272,20 @@ async def _heartbeat_colab(kid: str, now) -> None:
 _COLAB_UNCAPPED_SEC = 86400.0   # colab-cli requires a --timeout; this stands in for "none"
 
 
-async def exec_colab(kernel_id: str, code: str, timeout: float | None = None) -> dict[str, Any]:
+async def exec_colab(kernel_id: str, code: str, timeout: float | None = None,
+                     acquire_timeout: float | None = None) -> dict[str, Any]:
     """Execute code on a colab session via colab-cli; return a normalized reply
     {status, execution_count, outputs(nbformat), timed_out}. Serializes on the per-session
-    lock (colab-cli ops share one sessions.json; concurrent invocations can corrupt it)."""
+    lock (colab-cli ops share one sessions.json; concurrent invocations can corrupt it).
+    `acquire_timeout` bounds the wait on that lock — on expiry the reply is
+    status="kernel_busy" (introspection callers; a colab exec can hold it for a day)."""
     lock = state._locks.setdefault(kernel_id, asyncio.Lock())
-    async with lock:
+    try:
+        await asyncio.wait_for(lock.acquire(), acquire_timeout)
+    except TimeoutError:
+        return {"status": "kernel_busy", "execution_count": None, "outputs": [],
+                "timed_out": False}
+    try:
         # Same policy as the local backend (ADR 0018): only an EXPLICIT cap interrupts.
         # This used to floor at 180s, which — now that EXEC_TIMEOUT_SEC defaults to 0 —
         # would have left colab, the GPU backend, as the one place a long job still died
@@ -338,3 +346,5 @@ async def exec_colab(kernel_id: str, code: str, timeout: float | None = None) ->
                 "you actually want to abort (it keeps the VM + files, just resets Python)."
             )
         return res
+    finally:
+        lock.release()

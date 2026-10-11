@@ -301,7 +301,13 @@ async def list_variables(kernel_id: str) -> Any:
     so rather than hanging. Collect that execution with get_execution first."""
     # Talks to the local kernel directly, so it bypasses backends._resolve_backend —
     # guard it here too (introspection still evaluates code in the kernel).
-    backends._assert_exec_allowed(state._backend_of(kernel_id), kernel_id)
+    backend = state._backend_of(kernel_id)
+    backends._assert_exec_allowed(backend, kernel_id)
+    if backends.is_cli(backend):
+        raise RuntimeError(
+            f"list_variables is not supported on the '{backend}' backend — it uses the "
+            "local Jupyter kernel protocol. Inspect a colab kernel with execute_code "
+            "(e.g. `print(dir())`) or colab_log instead.")
     # Introspection runs code in the kernel, so it would queue behind a running execution
     # and return nothing for as long as that one lasts — the no-reply failure ADR 0018
     # exists to remove. Refuse fast and point at the tool that does answer.
@@ -313,8 +319,26 @@ async def list_variables(kernel_id: str) -> Any:
                          "listing variables needs the kernel, so it was refused rather than "
                          f"left to hang. Collect it with get_execution('{kernel_id}', "
                          "wait_seconds=20), then retry.")}
-    kc = await local_jupyter._get_client(kernel_id)
-    return await asyncio.to_thread(kc.list_variables)
+    # Out-of-band work (a human's JupyterLab cell) never appears in running_exec.
+    if await local_jupyter._kernel_busy_oob(kernel_id):
+        return {"kernel_id": kernel_id, "status": "kernel_busy", "running": None,
+                "note": (f"kernel '{kernel_id}' is busy executing code that did NOT come "
+                         "through this server (e.g. a JupyterLab cell); listing variables "
+                         "needs the kernel, so it was refused rather than left to queue "
+                         "behind it. Retry once that execution finishes.")}
+    lock = state._locks.setdefault(kernel_id, asyncio.Lock())
+    try:
+        await asyncio.wait_for(lock.acquire(), state._INTROSPECT_LOCK_WAIT_SEC)
+    except TimeoutError:
+        return {"kernel_id": kernel_id, "status": "kernel_busy", "running": None,
+                "note": (f"kernel '{kernel_id}' is busy with another execution and the "
+                         "wait budget ran out; listing variables needs the kernel, so it "
+                         "was refused rather than left to hang. Retry shortly.")}
+    try:
+        kc = await local_jupyter._get_client(kernel_id)
+        return await asyncio.to_thread(kc.list_variables)
+    finally:
+        lock.release()
 
 
 @mcp.tool
