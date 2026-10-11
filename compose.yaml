@@ -61,7 +61,7 @@ services:
       # https://lab.example.com). Empty = only loopback-Origin requests pass.
       - MCP_ALLOWED_ORIGINS=${MCP_ALLOWED_ORIGINS:-}
       # Opt-in Host allowlist — leave EMPTY behind a tunnel/proxy (it forwards the
-      # public Host; pinning would 421 every request). See docs/AUTH.md.
+      # public Host; pinning would 421 every request). See docs/adr/0019-mcp-origin-guard.md.
       - MCP_ALLOWED_HOSTS=${MCP_ALLOWED_HOSTS:-}
       # Colab-only deployment: refuse to execute code on the local backend (the local
       # Jupyter still stores/serves the notebooks). Requires working ADC creds below.

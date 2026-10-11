@@ -276,6 +276,10 @@ async def execute_cell(kernel_id: str, index: int | None = None, cell_id: str | 
     outputs in place (no duplicate). Target by `cell_id` (stable, preferred) OR `index`.
     Editing (patch_cell/edit_cell) is separate — this only runs a cell as-is.
 
+    `timeout` (optional) is a HARD cap: exceeding it INTERRUPTS the kernel. An explicit
+    `timeout=0` means NEVER interrupt — it forces no cap even when the server default is
+    a hard one. Long cells should pass 0 (or rely on a 0 server default).
+
     IF THIS CALL APPEARS TO FAIL OR TIME OUT, the cell may still be running or may have
     ALREADY completed. NEVER resend it as your first move — call get_execution(kernel_id)
     to find out, and only re-run once you have CONFIRMED it never ran. Long cells come back

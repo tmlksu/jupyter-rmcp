@@ -61,6 +61,10 @@ public release — earlier history is the private development of the same code.
   at which you get a reply. **Upgrade note:** an existing `.env` pinning
   `EXEC_TIMEOUT_SEC=120` keeps interrupting long executions at two minutes — set
   it to `0` to get the detach-and-keep-running behavior.
+- **An explicit `timeout=0` now means "never interrupt", not "server default".**
+  It used to fall through to `EXEC_TIMEOUT_SEC` like an omitted argument; it now
+  forces no cap even when the server default is a hard one. Omitting `timeout`
+  still means the server default.
 
 ### Fixed
 - **A long execution no longer runs twice when the client gives up on it.** MCP
@@ -106,8 +110,11 @@ public release — earlier history is the private development of the same code.
   the exact invariant ADR 0018 exists to keep. Introspection now checks the
   kernel's real `execution_state` for out-of-band work, waits on the per-kernel
   lock for at most a few seconds, and answers `status: "kernel_busy"` — never
-  interrupting. `list_variables` also explicitly refuses non-local backends
-  instead of crashing with a `KeyError` on colab kernels.
+  interrupting. A cell that starts *between* the check and the read can't stall
+  the poll either: the wait is bounded (and never cancels the queued read).
+  `list_variables` also explicitly refuses non-local backends instead of
+  crashing with a `KeyError` on colab kernels, and the background-job **launch**
+  exec follows the same no-interrupt rule.
 
 - **`MAX_KERNELS` capacity enforcement actually runs now.** `start_kernel`'s
   sessions path (every normal start) returned before the capacity check, making
@@ -122,8 +129,10 @@ public release — earlier history is the private development of the same code.
   each structured `outputs[i].text` shipped to the client uncapped — one big
   `print` could swamp an agent's context. Consecutive same-stream outputs now
   merge into one entry that keeps a head+tail char budget (with an elision
-  marker), the entry count is capped, and every per-output text field is capped
-  individually.
+  marker), non-stream entries are individually capped (a marker replaces one
+  giant image), the entry count is capped (dropped middle entries leave an
+  elision marker), and every per-output text field is capped head+tail — so the
+  *end* of a stream, where the result usually lands, is never cut away.
 
 - **The colab keep-alive heartbeat no longer stalls the whole reaper.** It
   waited on the per-session lock with no timeout while a `colab exec` can hold it

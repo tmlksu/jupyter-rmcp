@@ -32,16 +32,44 @@ allowlist containing only loopback names would 421 every proxied request.
    connectors — pass through unexamined.
 3. `MCP_ALLOWED_HOSTS` (env, default empty → passed as `None`) stays an **opt-in**
    Host allowlist. Empty is deliberate: a proxied deployment must accept its
-   public hostname in `Host`, and "auto" already pins loopback deployments to
-   loopback Hosts via the guard's defaults.
+   public hostname in `Host`.
 4. Non-browser clients are unaffected; a browser page on a loopback deployment
    hitting `/mcp` cross-origin now gets 403, closing the rebinding path.
+
+### What the guard actually checks (verified by live probing)
+
+The middleware keys its *automatic* Host validation off `scope["server"]` — the
+connection's **local address**, not the configured bind. In the documented Docker
+deployment uvicorn binds `0.0.0.0` inside the container, so `scope["server"]` is
+the container IP (e.g. `172.x`): the loopback Host fallback does **not** engage,
+and `Host: evil.example` with no Origin returns **200**. In other words, in the
+container deployment only the Origin check protects `/mcp`. That is sufficient:
+the attack this guard exists for is a browser-driven request, and a browser
+cross-origin POST always carries `Origin`; every client that legitimately omits
+it is a non-browser MCP client.
+
+Caveat: the same `scope["server"]` rule works the other way on a **non-container**
+run. A bare `uvicorn` bound to `127.0.0.1` with cloudflared on the same host sees
+a loopback local address, so Host validation *does* engage with loopback defaults
+— and a proxied request carrying the public Host gets **421**. Such a deployment
+must set `MCP_ALLOWED_HOSTS` to its public hostname.
+
+### Rejected: `host_origin_protection=True` (strict mode)
+
+Strict validates `Host` on every request against loopback defaults + the explicit
+list + `scope["server"]`'s host. In the container that last entry is the container
+IP, not the public hostname — so strict 421s the tunnel deployment exactly like a
+loopback-only Host allowlist would, while buying nothing the `"auto"` + explicit
+origins combination doesn't already provide. Rejected for the same reason the
+Host allowlist is opt-in.
 
 ## Consequences
 
 - A deployment whose browser flows legitimately POST to `/mcp` cross-origin must
   set `MCP_ALLOWED_ORIGINS` — none of the documented flows do that.
-- Operators serving `/mcp` directly (no tunnel) can opt into Host pinning via
-  `MCP_ALLOWED_HOSTS`.
-- The guard also validates `Host` when the server itself binds loopback (host
-  venv dev flow), with the usual loopback defaults — no behavior change there.
+- A **non-container** deployment behind a same-host tunnel/proxy must set
+  `MCP_ALLOWED_HOSTS` to its public hostname (see the caveat above). The
+  documented Docker deployment needs neither.
+- Host forgery is *not* defended in the container deployment — a non-browser
+  client can send any Host. No documented flow depends on Host, so this is
+  accepted; operators who need it can opt in via `MCP_ALLOWED_HOSTS`.
