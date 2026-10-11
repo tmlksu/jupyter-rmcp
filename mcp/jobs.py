@@ -288,9 +288,12 @@ async def get_job(kernel_id: str, job_id: str, offset: int | None = None,
 
 
 _JOB_POLL_INTERVAL_SEC = 5.0
-# Bound on the poll EXEC itself: the busy check above is a snapshot — a human's cell
-# can start a millisecond after it and queue our read behind hours of work. The wait
-# does NOT cancel (the read still completes on the kernel); we just stop waiting.
+# Bound on the poll EXEC itself — LOCAL only: the race it guards (a human's cell
+# starting after the busy check and queueing our read on the kernel) doesn't exist
+# on colab, where the race IS the session lock (already bounded by acquire_timeout)
+# and a poll legitimately takes >5s (auth + VM round trip). Bounding colab would
+# report kernel_busy wrongly AND strand the lock. The wait does NOT cancel — a
+# queued read still completes on the kernel; we just stop waiting for it.
 _POLL_EXEC_WAIT_SEC = 5.0
 
 
@@ -354,11 +357,18 @@ async def _poll_job(kernel_id: str, job_id: str, offset: int | None,
         # would queue, then kill that cell at the cap. timeout=0 = no cap, and the bounded
         # lock acquire is what keeps the answer prompt. On colab the timeout only bounds
         # the reply wait (never kills), so it stays.
-        task = asyncio.ensure_future(backends._run_on_kernel(
+        coro = backends._run_on_kernel(
             kernel_id, _job_poll_code(job_id, offset, mx), timeout=60 if cli else 0,
-            acquire_timeout=state._INTROSPECT_LOCK_WAIT_SEC))
-        done, _ = await asyncio.wait({task}, timeout=_POLL_EXEC_WAIT_SEC)
-        reply = task.result() if done else None
+            acquire_timeout=state._INTROSPECT_LOCK_WAIT_SEC)
+        if cli:
+            # No extra bound: a colab poll legitimately takes >5s, its own 60s bounds
+            # the wait, and an abandoned exec would strand the session lock for the
+            # NEXT poll — stuck answering busy.
+            reply = await coro
+        else:
+            task = asyncio.ensure_future(coro)
+            done, _ = await asyncio.wait({task}, timeout=_POLL_EXEC_WAIT_SEC)
+            reply = task.result() if done else None
     except RuntimeError as e:
         # routing guard fired: the (colab) session is already gone
         if "no longer alive" in str(e) or "not found" in str(e):
