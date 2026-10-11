@@ -41,7 +41,10 @@ async def _health(_request: Request) -> JSONResponse:
         await local_jupyter._http(LOCAL).get("/api")
         backend = "ok"
     except Exception as e:  # noqa: BLE001
-        backend = f"unreachable: {e}"
+        # Sanitized: the exception string embeds the internal JUPYTER_URL, and this
+        # route deliberately answers WITHOUT auth (smoke_test depends on that).
+        log.warning("health: local jupyter unreachable: %s", e)
+        backend = "unreachable"
     # The execution-policy fields are reported so a checker can assert the DEPLOYED values
     # (the smoke test times a slow execution against the real soft deadline, and a stale
     # EXEC_TIMEOUT_SEC silently reintroduces the interrupt this server no longer wants).
