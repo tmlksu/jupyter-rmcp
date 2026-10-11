@@ -50,7 +50,18 @@ async def _health(_request: Request) -> JSONResponse:
                          "exec_hard_timeout_sec": config.EXEC_TIMEOUT_SEC})
 
 
-app = mcp.http_app(path="/mcp", stateless_http=True, allowed_hosts=["*"], allowed_origins=["*"])
+# DNS-rebinding/Origin guard (ADR 0019): FastMCP's guard is OFF unless
+# host_origin_protection is set — the old allowed_hosts=["*"]/allowed_origins=["*"]
+# never did anything. "auto" + an explicit (possibly empty) origins list validates
+# every request carrying an Origin: allowlisted, or Origin+Host both loopback;
+# requests without an Origin header (every non-browser MCP client) pass through.
+# allowed_hosts stays None unless MCP_ALLOWED_HOSTS is set — an empty-but-explicit
+# list would flip host validation ON and 421 every tunnel-proxied request.
+app = mcp.http_app(
+    path="/mcp", stateless_http=True, host_origin_protection="auto",
+    allowed_hosts=config.MCP_ALLOWED_HOSTS or None,
+    allowed_origins=list(config.MCP_ALLOWED_ORIGINS),
+)
 
 
 def _check_colab_only() -> None:
