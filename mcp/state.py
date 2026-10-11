@@ -81,6 +81,54 @@ _LAST_TEXT_CHARS = 8000    # output text retained per kernel for get_execution
 _LAST_EXEC_MAX = 256       # cap on remembered kernels (stop_kernel normally prunes)
 _REPLAY_WINDOW_SEC = 300.0  # how long an abandoned execution's result stays replayable
 _PARTIAL_TEXT_CHARS = 4000  # tail of the live output shown with a still_running reply
+# How long an introspection exec (get_job's poll, list_variables) waits on the
+# per-kernel lock before answering kernel_busy. It must stay short: these callers
+# exist to answer quickly, and the lock can be held by a day-long execution.
+_INTROSPECT_LOCK_WAIT_SEC = 3.0
+
+
+# ---- bounded execution output sink -------------------------------------------
+# One dict per iopub message grew the live sink without bound (`while True: print()`
+# → this process bloats for hours) and made every _sink_text / write-back O(total).
+# Merging consecutive same-stream outputs + a head+tail char budget keeps the sink —
+# and everything derived from it — cheap.
+_SINK_STREAM_CHARS = 40000   # head+tail budget per merged stream output
+_SINK_MAX_OUTPUTS = 500      # cap on distinct (non-mergeable) output entries
+_STREAM_ELIDED = "\n... [intermediate stream output elided] ...\n"
+
+
+def _bounded_stream_text(text: str) -> str:
+    """Cap one stream output's text: keep head + tail with an elision marker."""
+    if len(text) <= _SINK_STREAM_CHARS:
+        return text
+    half = _SINK_STREAM_CHARS // 2
+    return text[:half] + _STREAM_ELIDED + text[-half:]
+
+
+class BoundedSink(list):
+    """The live output buffer for a running execution.
+
+    Consecutive outputs on the same stream MERGE into one entry whose text keeps a
+    head+tail char budget; the entry count is capped too (middle entries drop first —
+    head and tail are the informative ends). Behaves like a list otherwise: the
+    jupyter-kernel-client output_hook appends to it, and it is the notebook
+    write-back's output list."""
+
+    def append(self, output: dict[str, Any]) -> None:
+        if output.get("output_type") == "stream":
+            new = output.get("text") or ""
+            if (self and self[-1].get("output_type") == "stream"
+                    and self[-1].get("name") == output.get("name")):
+                prev = self[-1]
+                head, sep, tail = (prev.get("text") or "").partition(_STREAM_ELIDED)
+                # After the first elision, keep the original head and slide the tail.
+                prev["text"] = (head + sep + (tail + new)[-_SINK_STREAM_CHARS // 2:]
+                                if sep else _bounded_stream_text(head + new))
+                return
+            output = {**output, "text": _bounded_stream_text(new)}
+        if len(self) >= _SINK_MAX_OUTPUTS:
+            del self[len(self) // 2]
+        super().append(output)
 
 
 def _code_sha(code: str) -> str:
@@ -286,7 +334,7 @@ async def run_single_flight(kernel_id: str, code: str, tool: str,
         "exec_id": "exec-" + uuid.uuid4().hex[:8], "tool": tool,
         "code_sha": _code_sha(ident), "code_head": code[:_CODE_HEAD_CHARS],
         "started": time.monotonic(), "started_at": _now().isoformat(),
-        "sink": [], "detached": False, "abandoned": False}
+        "sink": BoundedSink(), "detached": False, "abandoned": False}
     _inflight[kernel_id] = info
     task = asyncio.ensure_future(_guarded(kernel_id, info, runner))
     info["task"] = task
