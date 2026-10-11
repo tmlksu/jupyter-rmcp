@@ -54,3 +54,18 @@ class TestFormatOutputs:
         assert text.startswith("x" * config.MAX_OUTPUT_CHARS)
         assert text.endswith(f"[truncated, {len(big)} chars total]")
         assert len(text) < len(big)
+
+    def test_each_structured_output_text_is_capped(self):
+        # MAX_OUTPUT_CHARS used to bound only the combined text — a single output
+        # (colab wraps ALL stdout into one) still shipped unbounded to the client.
+        big = "y" * (config.MAX_OUTPUT_CHARS + 5000)
+        structured, _ = outputs._format_outputs(
+            [{"output_type": "stream", "name": "stdout", "text": big}])
+        assert structured[0]["text"].endswith(f"[truncated, {len(big)} chars total]")
+        assert len(structured[0]["text"]) < len(big)
+
+    def test_execute_result_text_is_capped(self):
+        big = "z" * (config.MAX_OUTPUT_CHARS + 100)
+        structured, _ = outputs._format_outputs(
+            [{"output_type": "execute_result", "data": {"text/plain": big}}])
+        assert "truncated" in structured[0]["text"]
