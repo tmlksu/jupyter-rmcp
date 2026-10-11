@@ -60,11 +60,17 @@ async def _health(_request: Request) -> JSONResponse:
 # requests without an Origin header (every non-browser MCP client) pass through.
 # allowed_hosts stays None unless MCP_ALLOWED_HOSTS is set — an empty-but-explicit
 # list would flip host validation ON and 421 every tunnel-proxied request.
-app = mcp.http_app(
-    path="/mcp", stateless_http=True, host_origin_protection="auto",
-    allowed_hosts=config.MCP_ALLOWED_HOSTS or None,
-    allowed_origins=list(config.MCP_ALLOWED_ORIGINS),
-)
+def _build_app():
+    """The HTTP app, parameterized by config NOW — tests rebuild it with a patched
+    allowlist rather than duplicating these exact arguments."""
+    return mcp.http_app(
+        path="/mcp", stateless_http=True, host_origin_protection="auto",
+        allowed_hosts=config.MCP_ALLOWED_HOSTS or None,
+        allowed_origins=list(config.MCP_ALLOWED_ORIGINS),
+    )
+
+
+app = _build_app()
 
 
 def _check_colab_only() -> None:
