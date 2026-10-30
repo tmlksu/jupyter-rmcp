@@ -16,8 +16,10 @@ local_jupyter._http.
 import asyncio
 import base64
 import ipaddress
+import json
 import threading
 import time
+import types
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
@@ -30,7 +32,7 @@ import state
 import workspace
 from backends import colab_cli, local_jupyter
 from registry import KernelRegistry
-from util import _check_workspace_path
+from util import _check_workspace_path, _contents_url
 
 
 @pytest.fixture(autouse=True)
@@ -72,6 +74,8 @@ class _Contents:
         self.exists = exists
         self.puts = []      # (path, json-dict)
         self.gets = []
+        self.patches = []   # (path, json) — the rename into place
+        self.deletes = []   # path — temp cleanup + overwrite delete
 
     async def get(self, path, params=None, **_kw):
         self.gets.append(path)
@@ -80,6 +84,14 @@ class _Contents:
     async def put(self, path, json=None, **_kw):
         self.puts.append((path, json))
         return _Resp(201)
+
+    async def patch(self, path, json=None, **_kw):
+        self.patches.append((path, json))
+        return _Resp(200)
+
+    async def delete(self, path, **_kw):
+        self.deletes.append(path)
+        return _Resp(204)
 
     def file_puts(self):
         """Just the file uploads — auto-created parent directories also land in puts."""
@@ -130,8 +142,15 @@ class TestWorkspacePathValidator:
     def test_accepts_legitimate_paths(self, path):
         assert _check_workspace_path(path) == path
 
+    @pytest.mark.parametrize("given,normalized", [
+        ("/", ""), ("//", ""), ("/data", "data"), ("/a/b", "a/b"),
+        ("/etc/passwd", "etc/passwd"),   # leading / means "from the work root"
+    ])
+    def test_leading_slash_normalizes_to_root(self, given, normalized):
+        assert _check_workspace_path(given) == normalized
+
     @pytest.mark.parametrize("path", [
-        "/etc/passwd", "/abs", "..", "../x", "a/../b", "a/../../z", "./../x",
+        "..", "../x", "a/../b", "a/../../z", "./../x", "/../x",
         "a\x00b", "x\x00", "a\\b", "..\\x", "C:\\win", "\\\\server\\share",
         "%2e%2e/x", "a%2f..%2fb", "%00", "..%2f..",
     ])
@@ -292,11 +311,16 @@ class TestFetchTransfer:
         assert r["bytes"] == 2500
         assert contents.chunk_sequence() == [1, 2, -1]
         assert contents.written_bytes() == body
-        assert contents.file_puts()[0][0].endswith("/d/f.bin")
+        # chunks land on a sibling TEMP, then rename into place — never a partial
+        tmp_path = contents.file_puts()[0][0]
+        assert ".partial-" in tmp_path
+        assert contents.patches == [(tmp_path, {"path": "d/f.bin"})]
+        assert contents.deletes == []   # target didn't exist — nothing to remove
 
     async def test_stream_aborts_at_the_cap(self, monkeypatch):
         """The byte counter aborts mid-stream — the rest of the body is never read."""
-        monkeypatch.setattr(local_jupyter, "_http", lambda _b: _Contents())
+        contents = _Contents()
+        monkeypatch.setattr(local_jupyter, "_http", lambda _b: contents)
         monkeypatch.setattr(config, "MAX_FETCH_BYTES", 1000)
         _stub_dns(monkeypatch, {"ok.example": ["8.8.8.8"]})
         served = []
@@ -311,6 +335,26 @@ class TestFetchTransfer:
             await workspace.fetch_to_workspace("http://ok.example/big", "f.bin", overwrite=True)
 
         assert len(served) == 1   # aborted after the first 64KB, not the whole 320KB
+        assert contents.patches == []                    # nothing renamed into place
+        assert len(contents.deletes) == 1              # the temp got cleaned up
+
+    async def test_failed_upload_leaves_no_target_and_no_temp(self, monkeypatch):
+        """T1: a mid-stream failure deletes the temp and never touches the target."""
+        contents = _Contents()
+        monkeypatch.setattr(local_jupyter, "_http", lambda _b: contents)
+        _stub_dns(monkeypatch, {"ok.example": ["8.8.8.8"]})
+
+        async def _explode():
+            yield b"first"
+            raise OSError("connection reset")
+        _mock_transport(monkeypatch, lambda _r: httpx.Response(
+            200, stream=AsyncIteratorByteStream(_explode())))
+
+        with pytest.raises(OSError):
+            await workspace.fetch_to_workspace("http://ok.example/f", "f.bin", overwrite=True)
+
+        assert contents.patches == []
+        assert [d for d in contents.deletes if ".partial-" in d]
 
     async def test_oversized_content_length_refused_fast(self, monkeypatch):
         """A truthful Content-Length over the cap fails before the body is read."""
@@ -355,6 +399,16 @@ class TestChunkedUpload:
         n = await local_jupyter._write_file_chunked("f.bin", _gen())
         return n, contents
 
+    async def test_overwrite_deletes_target_then_renames(self, monkeypatch):
+        n, c = await self._write([b"new"], monkeypatch)
+        # second write over the same name: the existing file is DELETEd before rename
+        monkeypatch.setattr(local_jupyter, "_http", lambda _b: c)
+        c.exists = True
+        n2 = await local_jupyter._write_file_chunked("f.bin", _agen := _gen2(), overwrite=True)
+        assert n2 == 3
+        assert "/api/contents/f.bin" in c.deletes
+        assert c.patches[-1][1] == {"path": "f.bin"}
+
     async def test_multi_piece_numbering(self, monkeypatch):
         n, c = await self._write([b"aa", b"bb", b"cc"], monkeypatch)
         assert n == 6
@@ -375,6 +429,10 @@ class TestChunkedUpload:
 
 
 # ---- #16: download_from_colab -------------------------------------------------
+async def _gen2():
+    yield b"new"
+
+
 class TestDownloadFromColab:
     def _setup_colab(self, monkeypatch, file_bytes: bytes):
         monkeypatch.setitem(state._backends, "colab", {"kind": "cli"})
@@ -402,6 +460,7 @@ class TestDownloadFromColab:
         assert r["workspace_path"] == "ckpt.bin"
         assert contents.chunk_sequence() == [1, 2, -1]
         assert contents.written_bytes() == body
+        assert ".partial-" in contents.file_puts()[0][0]
 
     async def test_over_cap_refused(self, monkeypatch):
         monkeypatch.setattr(config, "MAX_FETCH_BYTES", 100)
@@ -424,6 +483,37 @@ class TestDownloadFromColab:
         with pytest.raises(RuntimeError, match="invalid workspace_path"):
             await workspace.download_from_colab("rmcp-x", "/content/x", "../evil")
         assert called == []
+
+    async def test_download_killed_mid_flight_at_cap(self, monkeypatch):
+        """T2: the abort_check polls the landing file; colab-cli is killed at the cap."""
+        monkeypatch.setattr(config, "MAX_FETCH_BYTES", 100)
+        monkeypatch.setitem(state._backends, "colab", {"kind": "cli"})
+        state._registry.track("rmcp-x", "colab")
+        monkeypatch.setattr(local_jupyter, "_http", lambda _b: _Contents())
+        killed = []
+
+        class _Proc:
+            returncode = None
+            stdout = None
+            def kill(self):
+                killed.append(True)
+            async def communicate(self, _input=None):
+                for _ in range(5):
+                    with open(_tmp[0], "ab") as f:
+                        f.write(b"x" * 60)
+                    await asyncio.sleep(0.3)
+                return b"", b""
+            async def wait(self):
+                return 0
+        _tmp = []
+        async def _spawn(*a, **k):
+            _tmp.append(a[-1])
+            return _Proc()
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+
+        with pytest.raises(RuntimeError, match="mid-download"):
+            await workspace.download_from_colab("rmcp-x", "/content/huge.bin")
+        assert killed == [True]
 
     async def test_dotdot_remote_basename_refused(self, monkeypatch):
         monkeypatch.setitem(state._backends, "colab", {"kind": "cli"})
@@ -495,15 +585,115 @@ class TestOrphanedExecWorkers:
         release = threading.Event()
         calls = self._setup_exec(monkeypatch, ["kid-a", "kid-b"], release)
         monkeypatch.setattr(local_jupyter, "_exec_pool", ThreadPoolExecutor(max_workers=1))
+        monkeypatch.setattr(local_jupyter, "_EXEC_POOL_WORKERS", 1)
 
         t_a = asyncio.ensure_future(local_jupyter.exec_local("kid-a", "local", "A", timeout=0))
         await self._wait_for(lambda: calls == ["A"])       # A's worker is parked
-        t_b = asyncio.ensure_future(local_jupyter.exec_local("kid-b", "local", "B", timeout=0))
 
-        await asyncio.gather(t_a, t_b, return_exceptions=True)
-        assert calls == ["A"]          # B's worker never started while A was parked
-        assert local_jupyter._orphaned_exec_workers == 2   # A parked + B queued-abandoned
+        # A2: a saturated pool refuses at submit — never queues a stale work item
+        # that would later run user code after the caller was told to re-run.
+        with pytest.raises(RuntimeError, match="exec workers are busy"):
+            await local_jupyter.exec_local("kid-b", "local", "B", timeout=0)
 
         release.set()
-        await self._wait_for(lambda: calls == ["A", "B"] and
-                             local_jupyter._orphaned_exec_workers == 0)
+        await self._wait_for(lambda: local_jupyter._orphaned_exec_workers == 0
+                             and local_jupyter._exec_inflight == 0)
+        assert calls == ["A"]          # B never ran — no late execution
+        await asyncio.gather(t_a, return_exceptions=True)
+
+
+class TestReviewRound:
+    async def test_idn_host_is_punycode_in_host_and_sni(self, monkeypatch):
+        """T3: bücher.de must not UnicodeEncodeError — punycode Host + SNI."""
+        monkeypatch.setattr(local_jupyter, "_http", lambda _b: _Contents())
+        _stub_dns(monkeypatch, {"bücher.de": ["8.8.8.8"]})
+        requests = _mock_transport(monkeypatch, lambda _r: httpx.Response(200, stream=_aiter(b"x")))
+
+        await workspace.fetch_to_workspace("https://bücher.de/x", "f.bin")
+        req = requests[0]
+        assert req.headers["host"] == "xn--bcher-kva.de"
+        assert req.extensions["sni_hostname"] == "xn--bcher-kva.de"
+
+    async def test_ipv6_literal_bracketed_host_no_sni(self, monkeypatch):
+        """T3: IPv6 literal keeps brackets in Host and sends no SNI."""
+        url, headers, exts = workspace._pinned_request(
+            httpx.URL("http://[2606:4700::1111]/x"), "2606:4700::1111")
+        assert headers["Host"] == "[2606:4700::1111]"
+        assert exts == {}
+        url, headers, exts = workspace._pinned_request(
+            httpx.URL("https://[2606:4700::1111]/x"), "2606:4700::1111")
+        assert "sni_hostname" not in exts   # SNI is a hostname, not an address
+
+    async def test_fetch_client_ignores_proxy_env(self):
+        """T4: trust_env=False — a proxy's own DNS would undo the IP pin."""
+        async with workspace._fetch_client() as c:
+            assert c.trust_env is False
+
+    async def test_mixed_dns_answer_refused_outright(self, monkeypatch):
+        """T6: a host resolving to public AND private is refused — the whole
+        answer must be public; pinning the public subset leaves a fallback."""
+        monkeypatch.setattr(local_jupyter, "_http", lambda _b: _Contents())
+        _stub_dns(monkeypatch, {"mixed.example": ["8.8.8.8", "192.168.1.1"]})
+        with pytest.raises(RuntimeError, match="non-public"):
+            await workspace.fetch_to_workspace("http://mixed.example/", "f.bin")
+
+    async def test_total_deadline_bounds_drip_feed(self, monkeypatch):
+        """T5: per-read timeouts can't catch 1-byte/100s — the wall-clock can."""
+        monkeypatch.setattr(local_jupyter, "_http", lambda _b: _Contents())
+        monkeypatch.setattr(config, "FETCH_TOTAL_TIMEOUT_SEC", 0.05)
+        _stub_dns(monkeypatch, {"slow.example": ["8.8.8.8"]})
+
+        async def _drip():
+            yield b"x"
+            await asyncio.sleep(60)
+            yield b"never"
+        _mock_transport(monkeypatch, lambda _r: httpx.Response(
+            200, stream=AsyncIteratorByteStream(_drip())))
+        with pytest.raises(TimeoutError):
+            await workspace.fetch_to_workspace("http://slow.example/", "f.bin")
+
+    @pytest.mark.parametrize("path,expected", [
+        ("x#frag", "/api/contents/x%23frag"),
+        ("a?b", "/api/contents/a%3Fb"),
+        ("a%b", "/api/contents/a%25b"),
+        ("a b", "/api/contents/a%20b"),
+        ("café/x.ipynb", "/api/contents/caf%C3%A9/x.ipynb"),
+        ("d/nested/f.bin", "/api/contents/d/nested/f.bin"),
+    ])
+    def test_contents_url_encodes_path(self, path, expected):
+        """B2: #/?/%/space/unicode can't escape into fragment/query/another name."""
+        assert _contents_url(path) == expected
+
+    async def test_drop_wakes_worker_blocked_on_real_client_event(self, monkeypatch):
+        """A1: a worker parked on the REAL KernelWebSocketClient's
+        _message_received event unwinds when _drop_client wakes it."""
+        from jupyter_kernel_client.wsclient import KernelWebSocketClient
+        ws = KernelWebSocketClient(endpoint="ws://unused")
+        kc = types.SimpleNamespace(
+            stop=lambda: ws.stop_channels(),
+            _manager=types.SimpleNamespace(client=ws))
+        state._clients["kid-1"] = kc
+        monkeypatch.setattr(local_jupyter, "_rest_post",
+                            lambda *_a, **_k: asyncio.sleep(0))
+
+        exited = threading.Event()
+
+        def _parked():
+            ws._message_received.wait(timeout=30)   # the same wait the library blocks in
+            exited.set()
+        t = threading.Thread(target=_parked)
+        t.start()
+        await asyncio.sleep(0.05)
+        assert not exited.is_set()
+
+        await local_jupyter._drop_client("kid-1")
+        t.join(timeout=5)
+        assert exited.is_set()       # the parked worker actually unwound
+        assert "kid-1" not in state._clients
+
+    async def test_health_reports_exec_workers(self):
+        """A1: /health exposes exec_workers {active, orphaned, max}."""
+        from server import _health
+        out = json.loads((await _health(None)).body)
+        assert set(out["exec_workers"]) == {"active", "orphaned", "max"}
+        assert out["exec_workers"]["max"] == local_jupyter._EXEC_POOL_WORKERS
