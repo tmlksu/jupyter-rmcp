@@ -20,7 +20,7 @@ from app import mcp
 from backends import colab_cli, local_jupyter
 from config import LOCAL, MAX_FETCH_BYTES
 from outputs import _strip_ansi
-from util import _parent_dir
+from util import _check_workspace_path, _parent_dir
 
 
 @mcp.tool
@@ -126,6 +126,7 @@ async def upload_to_colab(kernel_id: str, workspace_path: str,
     fetch_to_workspace) ONTO the Colab VM for this kernel, so the notebook can open it
     there. `remote_path` defaults to /content/<basename>. Local kernels already see
     workspace files directly (no copy needed)."""
+    _check_workspace_path(workspace_path, "workspace_path")
     if not backends.is_colab_kernel(kernel_id):
         return {"kernel_id": kernel_id, "note": f"local kernel already sees the workspace; "
                 f"open '{workspace_path}' directly (relative to the work root)"}
@@ -153,6 +154,7 @@ async def download_from_colab(kernel_id: str, remote_path: str,
     if not backends.is_colab_kernel(kernel_id):
         raise RuntimeError("download_from_colab is for colab kernels; local files are already in the workspace")
     dest = (workspace_path or remote_path.rstrip("/").rsplit("/", 1)[-1]).lstrip("/")
+    _check_workspace_path(dest, "workspace_path")
     tmp = tempfile.NamedTemporaryFile(delete=False, prefix="rmcp_dl_")
     tmp.close()
     try:
@@ -175,6 +177,7 @@ async def download_from_colab(kernel_id: str, remote_path: str,
 async def list_notebooks(path: str = "") -> list[dict[str, Any]]:
     """List notebooks and subdirectories under `path` (relative to the work root).
     For ALL files (data, images, etc.) use list_files."""
+    _check_workspace_path(path)
     r = await local_jupyter._http(LOCAL).get(f"/api/contents/{path}".rstrip("/"))
     r.raise_for_status()
     content = r.json().get("content", [])
@@ -190,6 +193,7 @@ async def list_files(path: str = "") -> list[dict[str, Any]]:
     """List EVERYTHING (files + folders) under `path` in the workspace — notebooks,
     uploaded data, images, etc. Files live on the server (persistent) and are visible to
     kernels (cwd is the work root) and in JupyterLab."""
+    _check_workspace_path(path)
     r = await local_jupyter._http(LOCAL).get(f"/api/contents/{path}".rstrip("/"))
     r.raise_for_status()
     content = r.json().get("content", [])
@@ -201,6 +205,7 @@ async def list_files(path: str = "") -> list[dict[str, Any]]:
 async def create_folder(path: str) -> dict[str, Any]:
     """Create a folder (and any missing parent folders) under the work root. Notebook/
     file writes also auto-create parents, so you rarely need this explicitly."""
+    _check_workspace_path(path)
     await local_jupyter._ensure_dir(path)
     return {"path": path.strip("/"), "created": True}
 
@@ -211,6 +216,7 @@ async def upload_file(path: str, content_base64: str, overwrite: bool = False) -
     visible to kernels and JupyterLab). Auto-creates parent folders. For a human uploading
     from a phone/laptop, JupyterLab's Upload button is usually easier; use this when a
     client can provide the bytes (e.g. Claude Code) — set overwrite=True to replace."""
+    _check_workspace_path(path)
     if not overwrite:
         chk = await local_jupyter._http(LOCAL).get(f"/api/contents/{path}", params={"content": "0"})
         if chk.status_code == 200:
@@ -232,6 +238,7 @@ async def fetch_to_workspace(url: str, path: str, overwrite: bool = False) -> di
     """Download a URL to a file in the workspace, server-side (the server fetches
     it). Handy to bring in a test image/dataset by link when you can't upload from the
     device. Auto-creates parent folders; capped at 200 MB."""
+    _check_workspace_path(path)
     if not overwrite:
         chk = await local_jupyter._http(LOCAL).get(f"/api/contents/{path}", params={"content": "0"})
         if chk.status_code == 200:

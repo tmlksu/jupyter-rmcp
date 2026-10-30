@@ -20,6 +20,7 @@ import state
 from app import mcp
 from backends import local_jupyter
 from outputs import _format_outputs
+from util import _check_workspace_path
 
 
 async def _require_notebook(kernel_id: str) -> str:
@@ -102,6 +103,7 @@ def _resolve_target(nb: dict[str, Any], index: int | None, cell_id: str | None) 
 
 async def _load_nb(path: str) -> dict[str, Any]:
     """Read a notebook, assign+persist stable cell ids, return it. Raises if absent."""
+    _check_workspace_path(path)
     nb = await local_jupyter._read_nb(path)
     if nb is None:
         raise RuntimeError(f"notebook not found: {path}")
@@ -178,6 +180,7 @@ async def insert_cells(path: str, index: int, cells: list[dict[str, Any]],
     """Insert several cells at once, contiguously BEFORE `index` (index == cell count
     appends). `cells` = list of {cell_type, source, summary?}. Prefer this over many
     single inserts. Returns {indices, ids, rev}."""
+    _check_workspace_path(path)
     reaper._ensure_background()
     nb = await _load_nb(path)
     _check_rev(nb, expected_rev)
@@ -206,6 +209,7 @@ async def patch_cell(path: str, old: str, new: str, index: int | None = None,
     no full-source resend). Target by `cell_id` (stable, preferred) OR `index`. `old`
     must occur exactly once in the cell, else it errors (safer than a wrong guess).
     Does not touch outputs. Returns {index, id, rev}."""
+    _check_workspace_path(path)
     reaper._ensure_background()
     nb = await _load_nb(path)
     _check_rev(nb, expected_rev)
@@ -227,6 +231,7 @@ async def edit_cell(path: str, source: str, index: int | None = None,
     """Replace a cell's ENTIRE source (for small changes prefer patch_cell). Target by
     `cell_id` (preferred) OR `index`. `summary` sets metadata summary ("" clears).
     Does not execute or touch outputs. Returns {index, id, rev}."""
+    _check_workspace_path(path)
     reaper._ensure_background()
     nb = await _load_nb(path)
     _check_rev(nb, expected_rev)
@@ -244,6 +249,7 @@ async def edit_cell(path: str, source: str, index: int | None = None,
 async def delete_cell(path: str, index: int | None = None, cell_id: str | None = None,
                       expected_rev: str | None = None) -> dict[str, Any]:
     """Delete a cell, addressed by `cell_id` (preferred) OR `index`. Returns {rev, remaining}."""
+    _check_workspace_path(path)
     reaper._ensure_background()
     nb = await _load_nb(path)
     _check_rev(nb, expected_rev)
@@ -258,6 +264,7 @@ async def move_cell(path: str, to_index: int, from_index: int | None = None,
                     from_id: str | None = None, expected_rev: str | None = None) -> dict[str, Any]:
     """Move a cell to `to_index` (final 0-based position). Address the moved cell by
     `from_id` (preferred) OR `from_index`. Returns {rev}."""
+    _check_workspace_path(path)
     reaper._ensure_background()
     nb = await _load_nb(path)
     _check_rev(nb, expected_rev)
@@ -322,6 +329,7 @@ async def create_notebook(path: str, cells: list[dict[str, Any]] | None = None) 
     """Create a new notebook (.ipynb) under the work root, optionally seeded with `cells`
     (list of {cell_type, source, summary?}). To inspect/edit existing notebooks use
     list_cells / read_cells / patch_cell etc."""
+    _check_workspace_path(path)
     if not path.endswith(".ipynb"):
         path += ".ipynb"
     seeded = [_new_cell(c.get("cell_type", "code"), c.get("source", ""), c.get("summary"))

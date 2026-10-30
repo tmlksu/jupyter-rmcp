@@ -18,7 +18,7 @@ from app import mcp
 from backends import colab_cli, local_jupyter
 from config import COLAB, LOCAL
 from outputs import _format_outputs, _strip_ansi
-from util import _now, _parse_ts
+from util import _check_workspace_path, _now, _parse_ts
 
 
 @mcp.tool
@@ -121,6 +121,8 @@ async def start_kernel(name: str = "python3", notebook_path: str | None = None,
     if backend not in state._backends:
         raise RuntimeError(f"unknown backend '{backend}'. Available: {list(state._backends)}")
     backends._assert_exec_allowed(backend)
+    if notebook_path is not None:
+        _check_workspace_path(notebook_path, "notebook_path")
     notebook_path = await local_jupyter._resolve_notebook_path(notebook_path, if_exists)
     # Notebook file is always created/kept on LOCAL (single source of truth).
     if notebook_path:
