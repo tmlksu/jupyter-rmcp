@@ -89,6 +89,13 @@ services:
       # HuggingFace token for `setup_hf` (masked-inject into a Colab session on demand).
       - HF_TOKEN=${HF_TOKEN:-}
       - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+      # Workspace transfer cap in bytes (fetch_to_workspace, download_from_colab).
+      # Writes use the Contents API chunked upload, so memory stays ~one chunk
+      # regardless — this is a data policy, not a memory limit.
+      - MAX_FETCH_BYTES=${MAX_FETCH_BYTES:-}
+      # fetch_to_workspace refuses private/loopback/link-local targets (SSRF guard).
+      # Set 1 ONLY to fetch from your own LAN.
+      - FETCH_ALLOW_PRIVATE=${FETCH_ALLOW_PRIVATE:-}
     volumes:
       # Google ADC credentials for colab-cli (read-only). Set GCLOUD_ADC in .env to the
       # file `gcloud auth application-default login` writes. The /dev/null default keeps
@@ -102,6 +109,8 @@ services:
     ports:
       - "127.0.0.1:${MCP_HOST_PORT}:8000"
     networks: [internal]
+    mem_limit: 1g
+    cpus: 1.0
 
 networks:
   internal:
