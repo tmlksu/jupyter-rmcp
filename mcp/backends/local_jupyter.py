@@ -11,6 +11,7 @@ import asyncio
 import base64
 import uuid
 from collections.abc import AsyncIterable
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Any
 
@@ -19,7 +20,7 @@ from jupyter_kernel_client import KernelClient
 from jupyter_kernel_client.client import output_hook as _output_hook
 
 import state
-from config import EXEC_TIMEOUT_SEC, LOCAL, log
+from config import EXEC_TIMEOUT_SEC, LOCAL, MAX_KERNELS, log
 from util import _parent_dir
 
 
@@ -304,6 +305,40 @@ def _execute_streaming(kc: KernelClient, code: str, sink: list[dict[str, Any]],
 _LIB_DEADLINE_SEC = 30 * 24 * 3600
 _LIVENESS_INTERVAL_SEC = 30.0
 
+# Execution workers run the blocking jupyter-client call on a DEDICATED bounded
+# pool. A kernel that never answers (an interrupt-immune C-extension loop, a dead
+# VM, a restart that kept the websocket open) leaves its worker parked until
+# _LIB_DEADLINE_SEC; on the shared default executor those orphans would
+# eventually starve every other asyncio.to_thread call (connect, stop,
+# list_variables). A worker the waiter gave up on is counted and logged so the
+# leak is visible instead of silent (audit #17, item 2).
+_exec_pool = ThreadPoolExecutor(
+    max_workers=max(4, MAX_KERNELS), thread_name_prefix="rmcp-exec")
+_orphaned_exec_workers = 0
+
+
+def _orphan_worker(task: asyncio.Future, kernel_id: str) -> None:
+    """Mark an execution worker we are abandoning while it may still run.
+
+    The flag on the future makes repeated calls idempotent (several cleanup paths
+    can observe the same still-parked worker); the done callback restores the
+    count when the library finally unwinds it — or confirms it never does."""
+    global _orphaned_exec_workers
+    if task.done() or getattr(task, "_rmcp_orphaned", False):
+        return
+    task._rmcp_orphaned = True  # type: ignore[attr-defined]
+    _orphaned_exec_workers += 1
+    log.warning("execution worker on %s orphaned (kernel stopped replying); %d parked",
+                kernel_id, _orphaned_exec_workers)
+
+    def _unwound(_t: asyncio.Future) -> None:
+        global _orphaned_exec_workers
+        _orphaned_exec_workers -= 1
+        log.info("orphaned execution worker on %s unwound; %d still parked",
+                 kernel_id, _orphaned_exec_workers)
+
+    task.add_done_callback(_unwound)
+
 
 async def _kernel_is_running(kernel_id: str, backend: str) -> bool:
     """Is this kernel still executing something? Errors count as 'yes' — a transient
@@ -358,6 +393,7 @@ async def _await_uncapped(task: asyncio.Future, kernel_id: str, backend: str) ->
         misses += 1
         if misses >= 2:
             await _drop_client(kernel_id)   # let the orphaned worker unwind
+            _orphan_worker(task, kernel_id)
             raise RuntimeError(
                 f"kernel '{kernel_id}' stopped running this execution before it finished — it "
                 "was restarted or died underneath it (a manual restart in JupyterLab, or the "
@@ -402,8 +438,10 @@ async def exec_local(kernel_id: str, backend: str, code: str, timeout: float | N
         # jupyter_client's `timeout` does NOT bound total run time; enforce it here.
         # The worker thread can't be cancelled, so shield it, interrupt on timeout,
         # then wait a grace for it to unwind — holding the per-kernel lock throughout.
-        task = asyncio.ensure_future(
-            asyncio.to_thread(_execute_streaming, kc, code, sink, (to or 0) + _LIB_DEADLINE_SEC))
+        # It runs on the dedicated _exec_pool so a never-answering kernel parks a
+        # worker here instead of starving the shared default executor.
+        task = asyncio.get_running_loop().run_in_executor(
+            _exec_pool, partial(_execute_streaming, kc, code, sink, (to or 0) + _LIB_DEADLINE_SEC))
         try:
             # No hard cap (`to` == 0): wait for the work itself, watching the kernel rather
             # than a clock. Detaching (state.run_single_flight) is what keeps the CALLER
@@ -436,6 +474,7 @@ async def exec_local(kernel_id: str, backend: str, code: str, timeout: float | N
             reply["timed_out"] = True
             return reply
         except Exception as e:  # noqa: BLE001
+            _orphan_worker(task, kernel_id)
             await _drop_client(kernel_id)
             raise RuntimeError(f"execution failed: {e}") from e
     finally:
