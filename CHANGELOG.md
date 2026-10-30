@@ -157,6 +157,48 @@ public release — earlier history is the private development of the same code.
   returns the raw exception string — it embedded the internal `JUPYTER_URL` —
   reporting a sanitized `unreachable` instead (the detail is still logged).
 
+- **`fetch_to_workspace` can no longer fetch your internal network — and can't
+  OOM trying.** A server-side GET of an arbitrary URL followed redirects
+  unexamined, checked its size cap only *after* buffering the whole body, and
+  was happy to dial `169.254.169.254` or a docker-bridge gateway — a complete
+  fetch-and-exfiltrate primitive, and in `COLAB_ONLY` deployments the only
+  network primitive at all. Targets are now http(s) only; the host's resolved
+  addresses must be public (private/loopback/link-local/reserved/multicast
+  refused, IPv4-mapped v6 judged as the v4 it reaches); redirects are followed
+  manually with every hop re-validated; and the connection is **pinned to the
+  validated IP** (original `Host` + TLS SNI preserved), so a DNS rebind between
+  check and connect can't smuggle a second answer through. The body streams with
+  a byte counter that aborts at `MAX_FETCH_BYTES` — now an env var — and the
+  write goes through the Contents API's chunked upload, so ~4 MB crosses at a
+  time instead of 200 MB + base64 landing in a 256 MB container.
+  `FETCH_ALLOW_PRIVATE=1` opts out for same-LAN targets. See
+  [ADR 0021](docs/adr/0021-transfer-hardening.md).
+
+- **`download_from_colab` no longer reads a whole checkpoint into memory and
+  dies on the PUT.** It `stat`s the downloaded file first, refuses over
+  `MAX_FETCH_BYTES`, and streams the rest through the same chunked Contents-API
+  upload — a multi-GB result now fails cleanly instead of freezing the event
+  loop or losing the 30 s timeout race.
+
+- **Every workspace path is validated at the MCP layer.** A shared validator
+  (`util._check_workspace_path`) rejects absolute paths, `..` segments, NUL
+  bytes, backslashes and their URL-encoded forms at the entry of every tool
+  taking `path`/`workspace_path`/`notebook_path`/`dest` — the root-escape check
+  no longer leans on jupyter-server alone. `jupyter_server>=2.18` is now a hard
+  floor in both jupyter images (its `AsyncLargeFileManager` is also what the
+  chunked upload needs).
+
+- **Orphaned execution workers can no longer starve the shared executor.** A
+  kernel that never answers (interrupt-immune C loop, dead VM) used to park an
+  `asyncio.to_thread` worker on the *default* executor for up to ~30 days —
+  enough dead kernels and every other `to_thread` call (`connect`/`stop`/
+  `list_variables`) queued forever. Executions now run on a dedicated bounded
+  pool, and an abandoned worker is counted and logged when it's orphaned and
+  when it finally unwinds.
+
+- **The `mcp` service has resource limits** (`mem_limit: 1g`, `cpus: 1.0`) in the
+  base `compose.yaml`; slim keeps its 256m.
+
 ## [1.0.0] — 2026-07-22
 
 First public release.
