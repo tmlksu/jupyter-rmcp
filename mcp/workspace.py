@@ -6,19 +6,22 @@ list_files/create_folder/upload_file/fetch_to_workspace) are LOCAL-only.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
+import ipaddress
 import json
 import os
-import pathlib
+import socket
 import tempfile
 from typing import Any
 
 import httpx
 
 import backends
+import config
 from app import mcp
 from backends import colab_cli, local_jupyter
-from config import LOCAL, MAX_FETCH_BYTES
+from config import LOCAL
 from outputs import _strip_ansi
 from util import _check_workspace_path, _parent_dir
 
@@ -161,16 +164,25 @@ async def download_from_colab(kernel_id: str, remote_path: str,
         rc, out = await colab_cli._colab_cli("download", "-s", kernel_id, remote_path, tmp.name, timeout=300)
         if rc != 0:
             raise RuntimeError(f"colab download failed: {out.strip()}")
-        data = pathlib.Path(tmp.name).read_bytes()
+        size = os.path.getsize(tmp.name)
+        if size > config.MAX_FETCH_BYTES:
+            raise RuntimeError(
+                f"'{remote_path}' is {size} bytes, over the {config.MAX_FETCH_BYTES}-byte "
+                "transfer cap — split it on the colab side and download the pieces")
+        if _parent_dir(dest):
+            await local_jupyter._ensure_dir(_parent_dir(dest))
+        nbytes = await local_jupyter._write_file_chunked(dest, _file_chunks(tmp.name))
     finally:
         os.unlink(tmp.name)
-    if _parent_dir(dest):
-        await local_jupyter._ensure_dir(_parent_dir(dest))
-    put = await local_jupyter._http(LOCAL).put(f"/api/contents/{dest}",
-                                               json={"type": "file", "format": "base64",
-                                                     "content": base64.b64encode(data).decode()})
-    put.raise_for_status()
-    return {"kernel_id": kernel_id, "remote_path": remote_path, "workspace_path": dest, "bytes": len(data)}
+    return {"kernel_id": kernel_id, "remote_path": remote_path, "workspace_path": dest, "bytes": nbytes}
+
+
+async def _file_chunks(path: str):
+    """Read a local file in ~_UPLOAD_CHUNK_BYTES pieces, so a large download never
+    sits whole in this process's memory."""
+    with open(path, "rb") as f:  # noqa: PTH123
+        while piece := await asyncio.to_thread(f.read, local_jupyter._UPLOAD_CHUNK_BYTES):
+            yield piece
 
 
 @mcp.tool
@@ -233,26 +245,130 @@ async def upload_file(path: str, content_base64: str, overwrite: bool = False) -
     return {"path": path, "bytes": nbytes}
 
 
+# ---- fetch_to_workspace: bounded download over a validated, pinned route ------
+# A server-side fetch of an arbitrary URL is an SSRF primitive, so the target is
+# constrained three ways (ADR 0021): http(s) only; the host's resolved addresses
+# must be public — private/loopback/link-local/reserved/multicast are refused
+# (FETCH_ALLOW_PRIVATE=1 opts out); and redirects are followed MANUALLY with every
+# hop re-validated, while the connection itself is PINNED to the validated IP
+# (original Host header + TLS SNI preserved) so a DNS rebind between check and
+# connect can't smuggle a second answer through.
+_MAX_FETCH_REDIRECTS = 8
+_DOWNLOAD_CHUNK_BYTES = 64 * 1024
+_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+
+
+def _fetch_client() -> httpx.AsyncClient:
+    """The client fetch_to_workspace uses — a seam so tests inject a MockTransport.
+    Redirects stay OFF: each hop is re-validated and re-pinned by hand."""
+    return httpx.AsyncClient(follow_redirects=False, timeout=120.0)
+
+
+async def _resolve_ips(host: str, port: int) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Resolve a fetch target's host. Module-level so tests stub DNS, never touch it."""
+    infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    out, seen = [], set()
+    for *_, sockaddr in infos:
+        try:
+            addr = ipaddress.ip_address(sockaddr[0].split("%", 1)[0])   # strip any v6 scope
+        except ValueError:
+            continue
+        if addr not in seen:
+            seen.add(addr)
+            out.append(addr)
+    return out
+
+
+def _public_ip(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Only globally-routable unicast addresses are fetchable targets. An
+    IPv4-mapped v6 address is judged as the v4 address it actually reaches."""
+    a = getattr(addr, "ipv4_mapped", None) or addr
+    return (a.is_global and not (a.is_private or a.is_loopback or a.is_link_local
+                                 or a.is_multicast or a.is_reserved or a.is_unspecified))
+
+
+async def _pin_ip(url: httpx.URL) -> str:
+    """Pick the IP the connection will be pinned to, after validation. Refuses a
+    host whose answers are all non-public (FETCH_ALLOW_PRIVATE lifts the filter)."""
+    host = url.host
+    port = url.port or (443 if url.scheme == "https" else 80)
+    try:
+        ips = await _resolve_ips(host, port)
+    except OSError as e:
+        raise RuntimeError(f"cannot resolve fetch host {host!r}: {e}") from e
+    candidates = ips if config.FETCH_ALLOW_PRIVATE else [a for a in ips if _public_ip(a)]
+    if not candidates:
+        raise RuntimeError(
+            f"refusing to fetch {host!r}: it resolves only to non-public addresses "
+            "(private/loopback/link-local/reserved/multicast). Set FETCH_ALLOW_PRIVATE=1 "
+            "to permit same-LAN targets.")
+    return str(candidates[0])
+
+
+def _pinned_request(url: httpx.URL, ip: str) -> tuple[httpx.URL, dict[str, str], dict[str, Any]]:
+    """The connect-to-IP form of `url`: dial the validated IP while the original
+    host stays in the Host header and (for TLS) the SNI + cert verification name."""
+    default_port = 443 if url.scheme == "https" else 80
+    host = url.host if url.port in (None, default_port) else f"{url.host}:{url.port}"
+    extensions = {"sni_hostname": url.host} if url.scheme == "https" else {}
+    return url.copy_with(host=ip), {"Host": host}, extensions
+
+
+async def _download_chunks(resp: httpx.Response):
+    """Yield the body as ≤_UPLOAD_CHUNK_BYTES pieces, aborting the stream the moment
+    the running total passes the cap — the file is never buffered whole. (httpx's
+    aiter_bytes re-chunks transport pieces up to _DOWNLOAD_CHUNK_BYTES, so a single
+    piece can exceed the upload granularity; slice the buffer, don't dump it.)"""
+    total = 0
+    buf = bytearray()
+    async for piece in resp.aiter_bytes(_DOWNLOAD_CHUNK_BYTES):
+        total += len(piece)
+        if total > config.MAX_FETCH_BYTES:
+            raise RuntimeError(
+                f"download exceeded the {config.MAX_FETCH_BYTES}-byte cap; aborted")
+        buf += piece
+        while len(buf) >= local_jupyter._UPLOAD_CHUNK_BYTES:
+            yield bytes(buf[:local_jupyter._UPLOAD_CHUNK_BYTES])
+            del buf[:local_jupyter._UPLOAD_CHUNK_BYTES]
+    if buf:
+        yield bytes(buf)
+
+
 @mcp.tool
 async def fetch_to_workspace(url: str, path: str, overwrite: bool = False) -> dict[str, Any]:
     """Download a URL to a file in the workspace, server-side (the server fetches
     it). Handy to bring in a test image/dataset by link when you can't upload from the
-    device. Auto-creates parent folders; capped at 200 MB."""
+    device. Auto-creates parent folders; the transfer is capped (MAX_FETCH_BYTES,
+    default 200 MB) and only http(s) targets resolving to public IPs are fetched —
+    private/loopback/link-local hosts are refused (FETCH_ALLOW_PRIVATE=1 lifts that)."""
     _check_workspace_path(path)
     if not overwrite:
         chk = await local_jupyter._http(LOCAL).get(f"/api/contents/{path}", params={"content": "0"})
         if chk.status_code == 200:
             raise RuntimeError(f"'{path}' already exists (pass overwrite=True to replace)")
-    async with httpx.AsyncClient(follow_redirects=True, timeout=120.0) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-        data = r.content
-    if len(data) > MAX_FETCH_BYTES:
-        raise RuntimeError(f"file is {len(data)} bytes, over the {MAX_FETCH_BYTES} cap")
+    try:
+        target = httpx.URL(url)
+    except httpx.InvalidURL as e:
+        raise RuntimeError(f"invalid URL: {e}") from e
     if _parent_dir(path):
         await local_jupyter._ensure_dir(_parent_dir(path))
-    b64 = base64.b64encode(data).decode()
-    put = await local_jupyter._http(LOCAL).put(f"/api/contents/{path}",
-                                               json={"type": "file", "format": "base64", "content": b64})
-    put.raise_for_status()
-    return {"path": path, "bytes": len(data), "source_url": url}
+    async with _fetch_client() as client:
+        for _hop in range(_MAX_FETCH_REDIRECTS + 1):
+            if target.scheme not in ("http", "https"):
+                raise RuntimeError(
+                    f"unsupported URL scheme {target.scheme!r} — only http/https can be fetched")
+            ip = await _pin_ip(target)
+            pinned, headers, extensions = _pinned_request(target, ip)
+            async with client.stream("GET", pinned, headers=headers,
+                                     extensions=extensions) as resp:
+                if resp.status_code in _REDIRECT_STATUSES and resp.headers.get("location"):
+                    target = target.join(resp.headers["location"])
+                    continue   # the next hop is validated and pinned again
+                resp.raise_for_status()
+                declared = resp.headers.get("content-length")
+                if declared and declared.isdigit() and int(declared) > config.MAX_FETCH_BYTES:
+                    raise RuntimeError(
+                        f"file is {declared} bytes, over the {config.MAX_FETCH_BYTES}-byte cap")
+                nbytes = await local_jupyter._write_file_chunked(path, _download_chunks(resp))
+                return {"path": path, "bytes": nbytes, "source_url": url}
+        raise RuntimeError(f"fetch redirected more than {_MAX_FETCH_REDIRECTS} times")

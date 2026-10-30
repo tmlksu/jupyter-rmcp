@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import uuid
+from collections.abc import AsyncIterable
 from functools import partial
 from typing import Any
 
@@ -191,6 +192,49 @@ async def _read_workspace_bytes(path: str) -> bytes:
     r.raise_for_status()
     j = r.json()
     return base64.b64decode(j["content"]) if j.get("format") == "base64" else j.get("content", "").encode()
+
+
+# Contents-API chunked upload (LargeFileContentsManager — the jupyter_server
+# >= 2.18 default, and the floor jupyter/requirements.txt now pins): the file
+# crosses as ~4 MB pieces appended server-side, so neither this process nor the
+# Jupyter server buffers the whole body (ADR 0021).
+_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024
+
+
+async def _put_file_chunk(path: str, data: bytes, chunk: int) -> None:
+    """One Contents-API upload chunk: 1 = first (creates/replaces), 2..N = append,
+    -1 = last. A lone chunk=1 is already a complete write; the trailing -1 just
+    closes the sequence (runs the post-save hooks)."""
+    r = await _http(LOCAL).put(
+        f"/api/contents/{path}",
+        json={"type": "file", "format": "base64",
+              "content": base64.b64encode(data).decode(), "chunk": chunk})
+    r.raise_for_status()
+
+
+async def _write_file_chunked(path: str, chunks: AsyncIterable[bytes]) -> int:
+    """Write `chunks` to a workspace file via chunked upload; return bytes written.
+
+    Memory stays ~one pending piece: piece k+1 is only pulled after piece k is on
+    the wire. A failed transfer can leave a PARTIAL file — the first chunk already
+    replaced any old content, so a partial write never masquerades as the old file."""
+    it = aiter(chunks)
+    pending = await anext(it, None)
+    if pending is None:
+        await _put_file_chunk(path, b"", 1)   # an empty stream still creates the file
+        return 0
+    n = total = 0
+    while True:
+        nxt = await anext(it, None)
+        total += len(pending)
+        await _put_file_chunk(path, pending, 1 if n == 0 else (-1 if nxt is None else n + 1))
+        n += 1
+        if nxt is None:
+            break
+        pending = nxt
+    if n == 1:   # a lone piece was a full replace; -1 closes the upload sequence
+        await _put_file_chunk(path, b"", -1)
+    return total
 
 
 # ---- KernelClient management (backend-aware) --------------------------------

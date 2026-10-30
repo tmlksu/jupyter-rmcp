@@ -96,4 +96,13 @@ MCP_STATE_DIR = _env(
 # ---- output / payload tunables ----------------------------------------------
 MAX_OUTPUT_CHARS = 20000          # cap text returned per execution
 INCLUDE_IMAGE_BYTES = False       # keep mobile payloads small; images -> markers
-MAX_FETCH_BYTES = 200 * 1024 * 1024   # cap fetch_to_workspace at 200 MB
+# Cap on inbound file transfers (fetch_to_workspace's download + the
+# download_from_colab write-back). Both write through the Contents API chunked
+# upload, so memory stays ~one chunk no matter the value — this is a data
+# policy, not a memory guard (ADR 0021).
+MAX_FETCH_BYTES = int(_env("MAX_FETCH_BYTES", str(200 * 1024 * 1024)))
+# fetch_to_workspace resolves the target host and refuses private/loopback/
+# link-local/reserved/multicast addresses (re-checked per redirect hop, with the
+# connection pinned to the validated IP). This is the opt-out for legitimately
+# fetching from the same LAN — off by default (ADR 0021).
+FETCH_ALLOW_PRIVATE = _env("FETCH_ALLOW_PRIVATE", "").lower() in ("1", "true", "yes", "on")
