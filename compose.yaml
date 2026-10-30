@@ -96,6 +96,9 @@ services:
       # fetch_to_workspace refuses private/loopback/link-local targets (SSRF guard).
       # Set 1 ONLY to fetch from your own LAN.
       - FETCH_ALLOW_PRIVATE=${FETCH_ALLOW_PRIVATE:-}
+      # Wall-clock deadline for the whole fetch call (per-read timeouts can't
+      # catch a drip-feed server).
+      - FETCH_TOTAL_TIMEOUT_SEC=${FETCH_TOTAL_TIMEOUT_SEC:-}
     volumes:
       # Google ADC credentials for colab-cli (read-only). Set GCLOUD_ADC in .env to the
       # file `gcloud auth application-default login` writes. The /dev/null default keeps

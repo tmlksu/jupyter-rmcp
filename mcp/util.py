@@ -6,7 +6,7 @@ can share them without import cycles.
 from __future__ import annotations
 
 import datetime as dt
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 
 def _now() -> dt.datetime:
@@ -40,16 +40,26 @@ def _assert_clean_path(path: str, what: str) -> None:
 
 
 def _check_workspace_path(path: str, what: str = "path") -> str:
-    """Reject a workspace-relative path that could escape the work root.
+    """Normalize + validate a workspace-relative path; return the normalized form.
 
     The MCP layer does not lean on jupyter-server's own root-dir check alone
-    (ADR 0021): every tool entry validates here first. Returns the path
-    unchanged for clean input; raises RuntimeError otherwise.
+    (ADR 0021): every tool entry validates here first and uses the RETURNED
+    path. Leading "/" is normalized away — callers mean "from the work root",
+    and `list_files("/")` must keep working.
 
-    Refused: absolute paths, `..` segments, NUL bytes, backslashes (Windows
-    separators / UNC tricks), and the same after URL-decoding — a literal
-    `%2e%2e` or `%00` would decode to a traversal server-side. Allowed: "" or
-    "." (the work root), "sub/dir/x.ipynb", a leading "./"."""
+    Refused: `..` segments, NUL bytes, backslashes (Windows separators / UNC
+    tricks), and the same after URL-decoding — a literal `%2e%2e` or `%00`
+    would decode to a traversal server-side. Allowed: "" or "." or "/" (the
+    work root), "sub/dir/x.ipynb", a leading "./"."""
+    path = path.lstrip("/")
     _assert_clean_path(path, what)
     _assert_clean_path(unquote(path), what)
     return path
+
+
+def _contents_url(path: str) -> str:
+    """Build an /api/contents/{path} URL with the path percent-encoded — a raw
+    `#` would truncate into a fragment, `?` into a query string, and `%` into
+    a different name server-side. Slashes stay slashes (nested paths); every
+    other unsafe byte is encoded exactly once (httpx sends the URL as given)."""
+    return f"/api/contents/{quote(path, safe='/')}"

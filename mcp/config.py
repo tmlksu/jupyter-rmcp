@@ -106,3 +106,7 @@ MAX_FETCH_BYTES = int(_env("MAX_FETCH_BYTES", str(200 * 1024 * 1024)))
 # connection pinned to the validated IP). This is the opt-out for legitimately
 # fetching from the same LAN — off by default (ADR 0021).
 FETCH_ALLOW_PRIVATE = _env("FETCH_ALLOW_PRIVATE", "").lower() in ("1", "true", "yes", "on")
+# Wall-clock cap on the WHOLE fetch_to_workspace call (all redirect hops + the
+# streamed body). httpx's timeout is per-read, so a drip-feed server (1 byte per
+# 100 s) would hold the call open forever below the byte cap without this.
+FETCH_TOTAL_TIMEOUT_SEC = float(_env("FETCH_TOTAL_TIMEOUT_SEC", "600"))

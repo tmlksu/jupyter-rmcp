@@ -21,7 +21,7 @@ from jupyter_kernel_client.client import output_hook as _output_hook
 
 import state
 from config import EXEC_TIMEOUT_SEC, LOCAL, MAX_KERNELS, log
-from util import _parent_dir
+from util import _contents_url, _parent_dir
 
 
 def _http(backend: str = LOCAL) -> httpx.AsyncClient:
@@ -61,9 +61,9 @@ async def _ensure_dir(dirpath: str) -> None:
     cur = ""
     for seg in (s for s in dirpath.strip("/").split("/") if s):
         cur = f"{cur}/{seg}" if cur else seg
-        r = await _http(LOCAL).get(f"/api/contents/{cur}", params={"content": "0"})
+        r = await _http(LOCAL).get(_contents_url(cur), params={"content": "0"})
         if r.status_code == 404:
-            put = await _http(LOCAL).put(f"/api/contents/{cur}", json={"type": "directory"})
+            put = await _http(LOCAL).put(_contents_url(cur), json={"type": "directory"})
             put.raise_for_status()
         elif r.status_code != 200:
             r.raise_for_status()
@@ -72,7 +72,7 @@ async def _ensure_dir(dirpath: str) -> None:
 async def _ensure_notebook(path: str) -> None:
     """Create an empty .ipynb at `path` (relative to the work root) if it doesn't exist,
     auto-creating parent folders, so it shows up in JupyterLab and can be read back."""
-    r = await _http(LOCAL).get(f"/api/contents/{path}", params={"type": "notebook"})
+    r = await _http(LOCAL).get(_contents_url(path), params={"type": "notebook"})
     if r.status_code == 200:
         return
     if _parent_dir(path):
@@ -80,7 +80,7 @@ async def _ensure_notebook(path: str) -> None:
     nb = {"type": "notebook", "format": "json", "content": {
         "cells": [], "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
     }}
-    put = await _http(LOCAL).put(f"/api/contents/{path}", json=nb)
+    put = await _http(LOCAL).put(_contents_url(path), json=nb)
     put.raise_for_status()
 
 
@@ -114,7 +114,7 @@ async def _notebook_for_kernel(kernel_id: str) -> str | None:
 
 async def _read_nb(path: str) -> dict[str, Any] | None:
     """Read a notebook (nbformat dict) from the LOCAL contents API, or None if absent."""
-    r = await _http(LOCAL).get(f"/api/contents/{path}", params={"type": "notebook"})
+    r = await _http(LOCAL).get(_contents_url(path), params={"type": "notebook"})
     if r.status_code != 200:
         return None
     nb = r.json().get("content") or {}
@@ -128,7 +128,7 @@ async def _read_nb(path: str) -> dict[str, Any] | None:
 async def _write_nb(path: str, nb: dict[str, Any]) -> None:
     if _parent_dir(path):
         await _ensure_dir(_parent_dir(path))
-    r = await _http(LOCAL).put(f"/api/contents/{path}", json={"type": "notebook", "format": "json", "content": nb})
+    r = await _http(LOCAL).put(_contents_url(path), json={"type": "notebook", "format": "json", "content": nb})
     r.raise_for_status()
 
 
@@ -149,7 +149,7 @@ async def _append_cell(path: str, code: str, reply: dict[str, Any]) -> None:
 
 
 async def _nb_exists(path: str) -> bool:
-    r = await _http(LOCAL).get(f"/api/contents/{path}", params={"type": "notebook", "content": "0"})
+    r = await _http(LOCAL).get(_contents_url(path), params={"type": "notebook", "content": "0"})
     return r.status_code == 200
 
 
@@ -187,7 +187,7 @@ async def _resolve_notebook_path(notebook_path: str | None, if_exists: str) -> s
 
 async def _read_workspace_bytes(path: str) -> bytes:
     """Read a workspace file (on the server) as raw bytes via the Contents API."""
-    r = await _http(LOCAL).get(f"/api/contents/{path}", params={"type": "file", "format": "base64"})
+    r = await _http(LOCAL).get(_contents_url(path), params={"type": "file", "format": "base64"})
     if r.status_code == 404:
         raise RuntimeError(f"workspace file not found: {path}")
     r.raise_for_status()
@@ -207,35 +207,63 @@ async def _put_file_chunk(path: str, data: bytes, chunk: int) -> None:
     -1 = last. A lone chunk=1 is already a complete write; the trailing -1 just
     closes the sequence (runs the post-save hooks)."""
     r = await _http(LOCAL).put(
-        f"/api/contents/{path}",
+        _contents_url(path),
         json={"type": "file", "format": "base64",
               "content": base64.b64encode(data).decode(), "chunk": chunk})
     r.raise_for_status()
 
 
-async def _write_file_chunked(path: str, chunks: AsyncIterable[bytes]) -> int:
-    """Write `chunks` to a workspace file via chunked upload; return bytes written.
+def _partial_path(path: str) -> str:
+    """Sibling temp name for an in-flight upload. NOT dot-prefixed: the default
+    contents manager (allow_hidden=False) refuses to read or rename hidden files."""
+    return f"{path}.partial-{uuid.uuid4().hex[:8]}"
 
-    Memory stays ~one pending piece: piece k+1 is only pulled after piece k is on
-    the wire. A failed transfer can leave a PARTIAL file — the first chunk already
-    replaced any old content, so a partial write never masquerades as the old file."""
-    it = aiter(chunks)
-    pending = await anext(it, None)
-    if pending is None:
-        await _put_file_chunk(path, b"", 1)   # an empty stream still creates the file
-        return 0
-    n = total = 0
-    while True:
-        nxt = await anext(it, None)
-        total += len(pending)
-        await _put_file_chunk(path, pending, 1 if n == 0 else (-1 if nxt is None else n + 1))
-        n += 1
-        if nxt is None:
-            break
-        pending = nxt
-    if n == 1:   # a lone piece was a full replace; -1 closes the upload sequence
-        await _put_file_chunk(path, b"", -1)
-    return total
+
+async def _write_file_chunked(path: str, chunks: AsyncIterable[bytes],
+                              overwrite: bool = False) -> int:
+    """Write `chunks` to a workspace file ATOMICALLY-ISH: chunked upload into a
+    sibling temp name, renamed into place (PATCH) only once the whole body landed.
+
+    An abort/cap/error mid-stream leaves the temp file (deleted best-effort) and
+    never touches the target — no partial file masquerading as content, no good
+    file clobbered by a failed overwrite. With overwrite=True an existing target
+    is DELETEd first (rename refuses an existing destination)."""
+    tmp = _partial_path(path)
+    try:
+        it = aiter(chunks)
+        pending = await anext(it, None)
+        total = 0
+        if pending is None:
+            await _put_file_chunk(tmp, b"", 1)   # an empty stream still creates the file
+        else:
+            n = 0
+            while True:
+                nxt = await anext(it, None)
+                total += len(pending)
+                await _put_file_chunk(tmp, pending,
+                                      1 if n == 0 else (-1 if nxt is None else n + 1))
+                n += 1
+                if nxt is None:
+                    break
+                pending = nxt
+            if n == 1:   # a lone piece was a full write; -1 closes the sequence
+                await _put_file_chunk(tmp, b"", -1)
+        if overwrite:
+            # PATCH rename 409s on an existing destination — remove it first.
+            chk = await _http(LOCAL).get(_contents_url(path), params={"content": "0"})
+            if chk.status_code == 200:
+                d = await _http(LOCAL).delete(_contents_url(path))
+                if d.status_code not in (204, 404):
+                    d.raise_for_status()
+        r = await _http(LOCAL).patch(_contents_url(tmp), json={"path": path})
+        r.raise_for_status()
+        return total
+    except BaseException:
+        try:
+            await _http(LOCAL).delete(_contents_url(tmp))
+        except Exception as e:  # noqa: BLE001
+            log.warning("cleanup of partial upload %s failed: %s", tmp, e)
+        raise
 
 
 # ---- KernelClient management (backend-aware) --------------------------------

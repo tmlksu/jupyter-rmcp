@@ -122,7 +122,7 @@ async def start_kernel(name: str = "python3", notebook_path: str | None = None,
         raise RuntimeError(f"unknown backend '{backend}'. Available: {list(state._backends)}")
     backends._assert_exec_allowed(backend)
     if notebook_path is not None:
-        _check_workspace_path(notebook_path, "notebook_path")
+        notebook_path = _check_workspace_path(notebook_path, "notebook_path")
     notebook_path = await local_jupyter._resolve_notebook_path(notebook_path, if_exists)
     # Notebook file is always created/kept on LOCAL (single source of truth).
     if notebook_path:
