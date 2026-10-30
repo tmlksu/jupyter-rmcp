@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import threading
 import uuid
 from collections.abc import AsyncIterable
 from concurrent.futures import ThreadPoolExecutor
@@ -296,6 +297,21 @@ async def _drop_client(kernel_id: str) -> None:
             await asyncio.to_thread(kc.stop)
         except Exception as e:  # noqa: BLE001
             log.warning("error stopping client %s: %s", kernel_id, e)
+        _wake_exec_waiter(kc)
+
+
+def _wake_exec_waiter(kc: KernelClient) -> None:
+    """Unpark a worker blocked in execute_interactive's message wait.
+
+    stop_channels clears connection_ready but never SETs _message_received, so a
+    worker parked in `wait(timeout=~30d)` would otherwise stay there for a month.
+    Setting the event lets the wait return; the loop then sees connection_ready
+    cleared and raises — the orphaned worker finally unwinds. (Attribute path
+    verified against jupyter-kernel-client 0.9.0's wsclient.py.)"""
+    ws = getattr(getattr(kc, "_manager", None), "client", None)
+    ev = getattr(ws, "_message_received", None)
+    if ev is not None:
+        ev.set()
 
 
 def _execute_streaming(kc: KernelClient, code: str, sink: list[dict[str, Any]],
@@ -340,19 +356,38 @@ _LIVENESS_INTERVAL_SEC = 30.0
 # eventually starve every other asyncio.to_thread call (connect, stop,
 # list_variables). A worker the waiter gave up on is counted and logged so the
 # leak is visible instead of silent (audit #17, item 2).
+_EXEC_POOL_WORKERS = max(4, MAX_KERNELS)
 _exec_pool = ThreadPoolExecutor(
-    max_workers=max(4, MAX_KERNELS), thread_name_prefix="rmcp-exec")
-_orphaned_exec_workers = 0
+    max_workers=_EXEC_POOL_WORKERS, thread_name_prefix="rmcp-exec")
+_exec_inflight = 0           # submitted and not done (queued + running + orphaned)
+_orphaned_exec_workers = 0   # the parked subset of _exec_inflight
 
 
-def _orphan_worker(task: asyncio.Future, kernel_id: str) -> None:
+def _worker_entry(kc: KernelClient, code: str, sink: list, timeout: float,
+                  started: threading.Event) -> dict[str, Any]:
+    """Pool work item: mark it RUNNING before doing anything — until this fires,
+    a queued item must not be judged by kernel liveness (an idle kernel behind a
+    saturated pool proves nothing) nor interrupted (nothing runs yet)."""
+    started.set()
+    return _execute_streaming(kc, code, sink, timeout)
+
+
+def _exec_done(_fut: asyncio.Future) -> None:
+    global _exec_inflight
+    _exec_inflight -= 1
+
+
+def _orphan_worker(task: asyncio.Future, kernel_id: str,
+                   started: threading.Event | None = None) -> None:
     """Mark an execution worker we are abandoning while it may still run.
 
     The flag on the future makes repeated calls idempotent (several cleanup paths
     can observe the same still-parked worker); the done callback restores the
-    count when the library finally unwinds it — or confirms it never does."""
+    count when the library finally unwinds it — or confirms it never does. A
+    queued item that never started is not an orphan: it is pending work."""
     global _orphaned_exec_workers
-    if task.done() or getattr(task, "_rmcp_orphaned", False):
+    if (task.done() or getattr(task, "_rmcp_orphaned", False)
+            or (started is not None and not started.is_set())):
         return
     task._rmcp_orphaned = True  # type: ignore[attr-defined]
     _orphaned_exec_workers += 1
@@ -399,7 +434,8 @@ async def _kernel_busy_oob(kernel_id: str, backend: str = LOCAL) -> bool:
         return False
 
 
-async def _await_uncapped(task: asyncio.Future, kernel_id: str, backend: str) -> dict[str, Any]:
+async def _await_uncapped(task: asyncio.Future, kernel_id: str, backend: str,
+                          started: threading.Event) -> dict[str, Any]:
     """Wait for an execution with no hard cap — but notice if the kernel stops running it.
 
     `execute_interactive` returns only on an iopub `idle` whose parent matches ITS request.
@@ -409,19 +445,23 @@ async def _await_uncapped(task: asyncio.Future, kernel_id: str, backend: str) ->
     kernel would answer `busy` for the life of the process. Two consecutive non-busy
     observations mean our execution is gone, whatever the library still believes.
 
-    Never cancels the task — a watchdog that killed the work would defeat the whole point."""
+    Never cancels the task — a watchdog that killed the work would defeat the whole point.
+    `started` gates the whole judgment: until the pool work item is running, an idle
+    kernel proves nothing (a queued item behind a saturated pool looks identical)."""
     misses = 0
     while True:
         done, _ = await asyncio.wait({task}, timeout=_LIVENESS_INTERVAL_SEC)
         if done:
             return task.result()
+        if not started.is_set():
+            continue
         if await _kernel_is_running(kernel_id, backend):
             misses = 0
             continue
         misses += 1
         if misses >= 2:
-            await _drop_client(kernel_id)   # let the orphaned worker unwind
-            _orphan_worker(task, kernel_id)
+            await _drop_client(kernel_id)   # wake + let the orphaned worker unwind
+            _orphan_worker(task, kernel_id, started)
             raise RuntimeError(
                 f"kernel '{kernel_id}' stopped running this execution before it finished — it "
                 "was restarted or died underneath it (a manual restart in JupyterLab, or the "
@@ -463,24 +503,44 @@ async def exec_local(kernel_id: str, backend: str, code: str, timeout: float | N
                 "timed_out": False}
     try:
         kc = await _get_client(kernel_id)
+        # Refuse rather than queue: a work item queued on a saturated pool reads
+        # 'kernel idle' to the liveness watchdog on a healthy kernel and later runs
+        # user code after the caller was told to re-run — a double execution. The
+        # pool count includes orphaned workers parked on dead kernels, which is the
+        # only way a full pool stays full.
+        global _exec_inflight
+        if _exec_inflight >= _EXEC_POOL_WORKERS:
+            raise RuntimeError(
+                f"all {_EXEC_POOL_WORKERS} exec workers are busy or parked on dead "
+                "kernels; restart the mcp service")
         # jupyter_client's `timeout` does NOT bound total run time; enforce it here.
         # The worker thread can't be cancelled, so shield it, interrupt on timeout,
         # then wait a grace for it to unwind — holding the per-kernel lock throughout.
         # It runs on the dedicated _exec_pool so a never-answering kernel parks a
         # worker here instead of starving the shared default executor.
+        started = threading.Event()
         task = asyncio.get_running_loop().run_in_executor(
-            _exec_pool, partial(_execute_streaming, kc, code, sink, (to or 0) + _LIB_DEADLINE_SEC))
+            _exec_pool, partial(_worker_entry, kc, code, sink,
+                                (to or 0) + _LIB_DEADLINE_SEC, started))
+        _exec_inflight += 1
+        task.add_done_callback(_exec_done)
         try:
             # No hard cap (`to` == 0): wait for the work itself, watching the kernel rather
             # than a clock. Detaching (state.run_single_flight) is what keeps the CALLER
             # responsive; nothing here kills the execution, so a long job is never truncated.
             reply = (await asyncio.wait_for(asyncio.shield(task), timeout=to) if to
-                     else await _await_uncapped(task, kernel_id, backend))
+                     else await _await_uncapped(task, kernel_id, backend, started))
         except TimeoutError:
             log.info("execute exceeded %.0fs on %s; interrupting", to, kernel_id)
             try:
-                await _rest_post(f"/api/kernels/{kernel_id}/interrupt", backend=backend)
-                reply = await asyncio.wait_for(asyncio.shield(task), timeout=15)
+                # Only an execution that STARTED can be interrupted — a queued item
+                # has nothing running on the kernel to interrupt; wait for it
+                # the same way the uncapped path does (gated on `started`).
+                if started.is_set():
+                    await _rest_post(f"/api/kernels/{kernel_id}/interrupt", backend=backend)
+                    reply = await asyncio.wait_for(asyncio.shield(task), timeout=15)
+                else:
+                    reply = await _await_uncapped(task, kernel_id, backend, started)
             except TimeoutError:
                 # The interrupt did not land. Do NOT return yet: the kernel is still running
                 # our code, and returning would release the single-flight claim (ADR 0017)
@@ -490,7 +550,7 @@ async def exec_local(kernel_id: str, backend: str, code: str, timeout: float | N
                 log.info("interrupt did not unwind on %s; waiting for the kernel to go idle",
                          kernel_id)
                 try:
-                    reply = await _await_uncapped(task, kernel_id, backend)
+                    reply = await _await_uncapped(task, kernel_id, backend, started)
                 except RuntimeError:
                     await _drop_client(kernel_id)
                     return {"status": "timeout", "execution_count": None,
@@ -502,7 +562,7 @@ async def exec_local(kernel_id: str, backend: str, code: str, timeout: float | N
             reply["timed_out"] = True
             return reply
         except Exception as e:  # noqa: BLE001
-            _orphan_worker(task, kernel_id)
+            _orphan_worker(task, kernel_id, started)
             await _drop_client(kernel_id)
             raise RuntimeError(f"execution failed: {e}") from e
     finally:
