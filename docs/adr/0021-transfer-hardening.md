@@ -33,12 +33,19 @@ the host is resolved and every returned address must be public — private,
 loopback, link-local, reserved, multicast and unspecified are refused, judged
 through `ipv4_mapped` so `::ffff:127.0.0.1` is the v4 address it reaches.
 Redirects are followed manually (`follow_redirects=False`, max 8 hops) and each
-hop re-resolves and re-validates. The actual connection is then *pinned* to the
-validated IP — the request URL is rewritten to the IP, the original host is kept
-in the `Host` header, and TLS gets `sni_hostname` so SNI and certificate
-verification still check the real name — so a second, hostile DNS answer between
-validation and connect cannot redirect the dial. `FETCH_ALLOW_PRIVATE=1` is the
-opt-out for legitimately fetching from the same LAN.
+hop re-resolves and re-validates. A host is refused outright if ANY resolved
+address is non-public — a mixed answer gets no public-subset fallback. The
+actual connection is then *pinned* to the validated IP — the request URL is
+rewritten to the IP, the original host stays in the `Host` header (from
+`netloc`: IDN punycode, IPv6 brackets, non-default port all preserved), and TLS
+gets `sni_hostname` (from `raw_host`, omitted for IP literals) so SNI and
+certificate verification still check the real name — so a second, hostile DNS
+answer between validation and connect cannot redirect the dial. The client is
+built with `trust_env=False`, because an `HTTP(S)_PROXY` variable would give the
+dial back to an untrusted resolver and check the certificate against the pinned
+IP. A wall-clock `FETCH_TOTAL_TIMEOUT_SEC` (default 600) bounds the whole call —
+a per-read timeout can't catch a drip-feed server. `FETCH_ALLOW_PRIVATE=1` is
+the opt-out for legitimately fetching from the same LAN.
 
 **Contents-API chunked upload for writes.** Instead of lowering the slim cap or
 buffering-then-PUT, both `fetch_to_workspace` and `download_from_colab` write
@@ -47,9 +54,14 @@ through `PUT /api/contents/{path}` with `chunk: 1..N, -1` — the
 jupyter_server default. Each ~4 MB piece is base64'd, sent, and appended
 server-side; the next piece is only read once the previous one is on the wire.
 Memory stays ~one chunk at every `MAX_FETCH_BYTES` value, in both containers, so
-the 200 MB cap survives as a *data policy* on a 256 MB container. `chunk=1`
-replaces the file, so an aborted transfer leaves a partial file rather than a
-corrupted old one — and never leaves the old file masquerading as the new one.
+the 200 MB cap survives as a *data policy* on a 256 MB container. Uploads land in a sibling
+temp name (`<name>.partial-<rand>` — deliberately NOT dot-prefixed, because the
+default contents manager refuses hidden files) and are PATCH-renamed into place
+only once the whole body is on the server; an abort, cap, or error deletes the
+temp and never touches an existing target. `download_from_colab` additionally
+polls the landing file's size while its `colab` subprocess runs and kills it the
+moment it passes the cap — checking only after landing lets a too-big file fill
+the mcp container's disk first.
 This is why `jupyter/requirements.txt` and `Dockerfile.slim` now floor
 `jupyter_server>=2.18` (#13 asked for the floor on path-traversal grounds; the
 chunked upload gives it a second reason).
@@ -69,9 +81,16 @@ default `asyncio` executor has only `min(32, cpu+4)` threads shared by
 dedicated `ThreadPoolExecutor(max_workers=max(4, MAX_KERNELS))`; a worker the
 waiter abandons while it is still parked is counted (`_orphaned_exec_workers`)
 and logged on both the orphaning and the eventual unwind, so the leak is a
-metric, not a mystery. The bound keeps a pile-up of dead kernels from consuming
-the process; the dedicated pool keeps the pile-up from blocking unrelated
-`to_thread` work. A queued-but-abandoned worker is counted the same way.
+metric, not a mystery — and surfaced in `/health` as `exec_workers`. Two
+follow-ups proved the count alone wasn't enough: `stop_channels` never SETs
+`_message_received`, so a parked worker waited ~30 days even after its client
+was dropped — `_drop_client` now sets the event through a guarded attribute
+chain so the wait returns and the worker unwinds. And a work item *queued* on a
+saturated pool read 'kernel idle' to the liveness watchdog on a healthy kernel —
+a false 'kernel died' verdict followed by a late execution the caller thought
+was refused. The pool now refuses at submit when `inflight >= max_workers`, and
+a `started` event (set at the top of the work item) gates liveness, interrupt,
+and orphan judgment until the worker is actually running.
 
 ## Consequences
 
@@ -79,9 +98,8 @@ the process; the dedicated pool keeps the pile-up from blocking unrelated
   URL or by redirect; the DNS-rebind race is closed by construction, not luck.
 - Transfers are bounded end-to-end in both memory and bytes; the failure mode
   for a >cap transfer is a clean error, not an OOM kill.
-- An interrupted chunked upload can leave a partial file. That is the correct
-  failure: `chunk=1` already replaced the old content, so partial never reads
-  as valid.
+- An interrupted chunked upload leaves a stray `<name>.partial-*` only if the
+  best-effort delete also fails; the target is never touched mid-write.
 - `download_from_colab` refuses over-cap files after `stat` — split them on the
   colab side. `upload_to_colab`'s in-memory read and `upload_file` were left
   alone per the audit verdict: their bytes already arrived in memory.

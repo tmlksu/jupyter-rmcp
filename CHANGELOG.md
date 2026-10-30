@@ -171,14 +171,23 @@ public release — earlier history is the private development of the same code.
   a byte counter that aborts at `MAX_FETCH_BYTES` — now an env var — and the
   write goes through the Contents API's chunked upload, so ~4 MB crosses at a
   time instead of 200 MB + base64 landing in a 256 MB container.
-  `FETCH_ALLOW_PRIVATE=1` opts out for same-LAN targets. See
+  `FETCH_ALLOW_PRIVATE=1` opts out for same-LAN targets. A mixed public/private
+  DNS answer is refused outright (no public-subset fallback), the fetch client
+  ignores `HTTP(S)_PROXY` env vars that would undo the pin, a wall-clock
+  `FETCH_TOTAL_TIMEOUT_SEC` (default 600) bounds drip-feed servers, and
+  IDN/IPv6-literal hosts keep working (punycode Host/SNI, bracketed Host).
+  Uploads land in a sibling `<name>.partial-*` temp and are renamed into place
+  only when complete — a failed fetch can no longer clobber a good file or
+  leave a partial that blocks retry. See
   [ADR 0021](docs/adr/0021-transfer-hardening.md).
 
 - **`download_from_colab` no longer reads a whole checkpoint into memory and
-  dies on the PUT.** It `stat`s the downloaded file first, refuses over
-  `MAX_FETCH_BYTES`, and streams the rest through the same chunked Contents-API
-  upload — a multi-GB result now fails cleanly instead of freezing the event
-  loop or losing the 30 s timeout race.
+  dies on the PUT.** It streams through the chunked Contents-API upload and
+  refuses over `MAX_FETCH_BYTES` — enforced while the `colab` download
+  subprocess still runs (the landing file's size is polled ~twice a second and
+  the process killed at the cap, plus a post-landing stat for sub-interval
+  landings), so a multi-GB result can no longer fill the mcp container's disk
+  or freeze the event loop.
 
 - **Every workspace path is validated at the MCP layer.** A shared validator
   (`util._check_workspace_path`) rejects absolute paths, `..` segments, NUL
@@ -188,13 +197,17 @@ public release — earlier history is the private development of the same code.
   floor in both jupyter images (its `AsyncLargeFileManager` is also what the
   chunked upload needs).
 
-- **Orphaned execution workers can no longer starve the shared executor.** A
-  kernel that never answers (interrupt-immune C loop, dead VM) used to park an
-  `asyncio.to_thread` worker on the *default* executor for up to ~30 days —
-  enough dead kernels and every other `to_thread` call (`connect`/`stop`/
-  `list_variables`) queued forever. Executions now run on a dedicated bounded
-  pool, and an abandoned worker is counted and logged when it's orphaned and
-  when it finally unwinds.
+- **Orphaned execution workers can no longer starve the shared executor — and
+  they actually unwind now.** A kernel that never answers (interrupt-immune C
+  loop, dead VM, JupyterLab restart) used to park an `asyncio.to_thread` worker
+  on the *default* executor until the library's ~30-day timeout; executions now
+  run on a dedicated bounded pool, `_drop_client` sets the client's
+  `_message_received` event so the parked wait returns and the worker exits,
+  and the count is logged and exposed as `exec_workers` in `/health`. A
+  saturated pool refuses at submit instead of queueing — a queued item read
+  'kernel idle' to the liveness watchdog on a healthy kernel (a false
+  'kernel died' verdict) and would have run user code *after* the caller was
+  told to re-run.
 
 - **The `mcp` service has resource limits** (`mem_limit: 1g`, `cpus: 1.0`) in the
   base `compose.yaml`; slim keeps its 256m.
