@@ -14,7 +14,7 @@ RUN groupadd -g 100 users 2>/dev/null || true; \
     mkdir -p /home/jovyan/work /home/jovyan/kaggle && \
     chown -R 1000:100 /home/jovyan
 
-RUN pip install --no-cache-dir jupyterlab==4.* && \
+RUN pip install --no-cache-dir jupyterlab==4.* "jupyter_server>=2.18" && \
     find /usr/local -name '__pycache__' -type d -prune -exec rm -rf {} +
 
 COPY jupyter_server_config.py /etc/jupyter/jupyter_server_config.py

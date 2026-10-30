@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import threading
 import uuid
+from collections.abc import AsyncIterable
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Any
 
@@ -18,8 +21,8 @@ from jupyter_kernel_client import KernelClient
 from jupyter_kernel_client.client import output_hook as _output_hook
 
 import state
-from config import EXEC_TIMEOUT_SEC, LOCAL, log
-from util import _parent_dir
+from config import EXEC_TIMEOUT_SEC, LOCAL, MAX_KERNELS, log
+from util import _contents_url, _parent_dir
 
 
 def _http(backend: str = LOCAL) -> httpx.AsyncClient:
@@ -59,9 +62,9 @@ async def _ensure_dir(dirpath: str) -> None:
     cur = ""
     for seg in (s for s in dirpath.strip("/").split("/") if s):
         cur = f"{cur}/{seg}" if cur else seg
-        r = await _http(LOCAL).get(f"/api/contents/{cur}", params={"content": "0"})
+        r = await _http(LOCAL).get(_contents_url(cur), params={"content": "0"})
         if r.status_code == 404:
-            put = await _http(LOCAL).put(f"/api/contents/{cur}", json={"type": "directory"})
+            put = await _http(LOCAL).put(_contents_url(cur), json={"type": "directory"})
             put.raise_for_status()
         elif r.status_code != 200:
             r.raise_for_status()
@@ -70,7 +73,7 @@ async def _ensure_dir(dirpath: str) -> None:
 async def _ensure_notebook(path: str) -> None:
     """Create an empty .ipynb at `path` (relative to the work root) if it doesn't exist,
     auto-creating parent folders, so it shows up in JupyterLab and can be read back."""
-    r = await _http(LOCAL).get(f"/api/contents/{path}", params={"type": "notebook"})
+    r = await _http(LOCAL).get(_contents_url(path), params={"type": "notebook"})
     if r.status_code == 200:
         return
     if _parent_dir(path):
@@ -78,7 +81,7 @@ async def _ensure_notebook(path: str) -> None:
     nb = {"type": "notebook", "format": "json", "content": {
         "cells": [], "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
     }}
-    put = await _http(LOCAL).put(f"/api/contents/{path}", json=nb)
+    put = await _http(LOCAL).put(_contents_url(path), json=nb)
     put.raise_for_status()
 
 
@@ -112,7 +115,7 @@ async def _notebook_for_kernel(kernel_id: str) -> str | None:
 
 async def _read_nb(path: str) -> dict[str, Any] | None:
     """Read a notebook (nbformat dict) from the LOCAL contents API, or None if absent."""
-    r = await _http(LOCAL).get(f"/api/contents/{path}", params={"type": "notebook"})
+    r = await _http(LOCAL).get(_contents_url(path), params={"type": "notebook"})
     if r.status_code != 200:
         return None
     nb = r.json().get("content") or {}
@@ -126,7 +129,7 @@ async def _read_nb(path: str) -> dict[str, Any] | None:
 async def _write_nb(path: str, nb: dict[str, Any]) -> None:
     if _parent_dir(path):
         await _ensure_dir(_parent_dir(path))
-    r = await _http(LOCAL).put(f"/api/contents/{path}", json={"type": "notebook", "format": "json", "content": nb})
+    r = await _http(LOCAL).put(_contents_url(path), json={"type": "notebook", "format": "json", "content": nb})
     r.raise_for_status()
 
 
@@ -147,7 +150,7 @@ async def _append_cell(path: str, code: str, reply: dict[str, Any]) -> None:
 
 
 async def _nb_exists(path: str) -> bool:
-    r = await _http(LOCAL).get(f"/api/contents/{path}", params={"type": "notebook", "content": "0"})
+    r = await _http(LOCAL).get(_contents_url(path), params={"type": "notebook", "content": "0"})
     return r.status_code == 200
 
 
@@ -185,12 +188,83 @@ async def _resolve_notebook_path(notebook_path: str | None, if_exists: str) -> s
 
 async def _read_workspace_bytes(path: str) -> bytes:
     """Read a workspace file (on the server) as raw bytes via the Contents API."""
-    r = await _http(LOCAL).get(f"/api/contents/{path}", params={"type": "file", "format": "base64"})
+    r = await _http(LOCAL).get(_contents_url(path), params={"type": "file", "format": "base64"})
     if r.status_code == 404:
         raise RuntimeError(f"workspace file not found: {path}")
     r.raise_for_status()
     j = r.json()
     return base64.b64decode(j["content"]) if j.get("format") == "base64" else j.get("content", "").encode()
+
+
+# Contents-API chunked upload (LargeFileContentsManager — the jupyter_server
+# >= 2.18 default, and the floor jupyter/requirements.txt now pins): the file
+# crosses as ~4 MB pieces appended server-side, so neither this process nor the
+# Jupyter server buffers the whole body (ADR 0021).
+_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024
+
+
+async def _put_file_chunk(path: str, data: bytes, chunk: int) -> None:
+    """One Contents-API upload chunk: 1 = first (creates/replaces), 2..N = append,
+    -1 = last. A lone chunk=1 is already a complete write; the trailing -1 just
+    closes the sequence (runs the post-save hooks)."""
+    r = await _http(LOCAL).put(
+        _contents_url(path),
+        json={"type": "file", "format": "base64",
+              "content": base64.b64encode(data).decode(), "chunk": chunk})
+    r.raise_for_status()
+
+
+def _partial_path(path: str) -> str:
+    """Sibling temp name for an in-flight upload. NOT dot-prefixed: the default
+    contents manager (allow_hidden=False) refuses to read or rename hidden files."""
+    return f"{path}.partial-{uuid.uuid4().hex[:8]}"
+
+
+async def _write_file_chunked(path: str, chunks: AsyncIterable[bytes],
+                              overwrite: bool = False) -> int:
+    """Write `chunks` to a workspace file ATOMICALLY-ISH: chunked upload into a
+    sibling temp name, renamed into place (PATCH) only once the whole body landed.
+
+    An abort/cap/error mid-stream leaves the temp file (deleted best-effort) and
+    never touches the target — no partial file masquerading as content, no good
+    file clobbered by a failed overwrite. With overwrite=True an existing target
+    is DELETEd first (rename refuses an existing destination)."""
+    tmp = _partial_path(path)
+    try:
+        it = aiter(chunks)
+        pending = await anext(it, None)
+        total = 0
+        if pending is None:
+            await _put_file_chunk(tmp, b"", 1)   # an empty stream still creates the file
+        else:
+            n = 0
+            while True:
+                nxt = await anext(it, None)
+                total += len(pending)
+                await _put_file_chunk(tmp, pending,
+                                      1 if n == 0 else (-1 if nxt is None else n + 1))
+                n += 1
+                if nxt is None:
+                    break
+                pending = nxt
+            if n == 1:   # a lone piece was a full write; -1 closes the sequence
+                await _put_file_chunk(tmp, b"", -1)
+        if overwrite:
+            # PATCH rename 409s on an existing destination — remove it first.
+            chk = await _http(LOCAL).get(_contents_url(path), params={"content": "0"})
+            if chk.status_code == 200:
+                d = await _http(LOCAL).delete(_contents_url(path))
+                if d.status_code not in (204, 404):
+                    d.raise_for_status()
+        r = await _http(LOCAL).patch(_contents_url(tmp), json={"path": path})
+        r.raise_for_status()
+        return total
+    except BaseException:
+        try:
+            await _http(LOCAL).delete(_contents_url(tmp))
+        except Exception as e:  # noqa: BLE001
+            log.warning("cleanup of partial upload %s failed: %s", tmp, e)
+        raise
 
 
 # ---- KernelClient management (backend-aware) --------------------------------
@@ -223,6 +297,21 @@ async def _drop_client(kernel_id: str) -> None:
             await asyncio.to_thread(kc.stop)
         except Exception as e:  # noqa: BLE001
             log.warning("error stopping client %s: %s", kernel_id, e)
+        _wake_exec_waiter(kc)
+
+
+def _wake_exec_waiter(kc: KernelClient) -> None:
+    """Unpark a worker blocked in execute_interactive's message wait.
+
+    stop_channels clears connection_ready but never SETs _message_received, so a
+    worker parked in `wait(timeout=~30d)` would otherwise stay there for a month.
+    Setting the event lets the wait return; the loop then sees connection_ready
+    cleared and raises — the orphaned worker finally unwinds. (Attribute path
+    verified against jupyter-kernel-client 0.9.0's wsclient.py.)"""
+    ws = getattr(getattr(kc, "_manager", None), "client", None)
+    ev = getattr(ws, "_message_received", None)
+    if ev is not None:
+        ev.set()
 
 
 def _execute_streaming(kc: KernelClient, code: str, sink: list[dict[str, Any]],
@@ -260,6 +349,59 @@ def _execute_streaming(kc: KernelClient, code: str, sink: list[dict[str, Any]],
 _LIB_DEADLINE_SEC = 30 * 24 * 3600
 _LIVENESS_INTERVAL_SEC = 30.0
 
+# Execution workers run the blocking jupyter-client call on a DEDICATED bounded
+# pool. A kernel that never answers (an interrupt-immune C-extension loop, a dead
+# VM, a restart that kept the websocket open) leaves its worker parked until
+# _LIB_DEADLINE_SEC; on the shared default executor those orphans would
+# eventually starve every other asyncio.to_thread call (connect, stop,
+# list_variables). A worker the waiter gave up on is counted and logged so the
+# leak is visible instead of silent (audit #17, item 2).
+_EXEC_POOL_WORKERS = max(4, MAX_KERNELS)
+_exec_pool = ThreadPoolExecutor(
+    max_workers=_EXEC_POOL_WORKERS, thread_name_prefix="rmcp-exec")
+_exec_inflight = 0           # submitted and not done (queued + running + orphaned)
+_orphaned_exec_workers = 0   # the parked subset of _exec_inflight
+
+
+def _worker_entry(kc: KernelClient, code: str, sink: list, timeout: float,
+                  started: threading.Event) -> dict[str, Any]:
+    """Pool work item: mark it RUNNING before doing anything — until this fires,
+    a queued item must not be judged by kernel liveness (an idle kernel behind a
+    saturated pool proves nothing) nor interrupted (nothing runs yet)."""
+    started.set()
+    return _execute_streaming(kc, code, sink, timeout)
+
+
+def _exec_done(_fut: asyncio.Future) -> None:
+    global _exec_inflight
+    _exec_inflight -= 1
+
+
+def _orphan_worker(task: asyncio.Future, kernel_id: str,
+                   started: threading.Event | None = None) -> None:
+    """Mark an execution worker we are abandoning while it may still run.
+
+    The flag on the future makes repeated calls idempotent (several cleanup paths
+    can observe the same still-parked worker); the done callback restores the
+    count when the library finally unwinds it — or confirms it never does. A
+    queued item that never started is not an orphan: it is pending work."""
+    global _orphaned_exec_workers
+    if (task.done() or getattr(task, "_rmcp_orphaned", False)
+            or (started is not None and not started.is_set())):
+        return
+    task._rmcp_orphaned = True  # type: ignore[attr-defined]
+    _orphaned_exec_workers += 1
+    log.warning("execution worker on %s orphaned (kernel stopped replying); %d parked",
+                kernel_id, _orphaned_exec_workers)
+
+    def _unwound(_t: asyncio.Future) -> None:
+        global _orphaned_exec_workers
+        _orphaned_exec_workers -= 1
+        log.info("orphaned execution worker on %s unwound; %d still parked",
+                 kernel_id, _orphaned_exec_workers)
+
+    task.add_done_callback(_unwound)
+
 
 async def _kernel_is_running(kernel_id: str, backend: str) -> bool:
     """Is this kernel still executing something? Errors count as 'yes' — a transient
@@ -292,7 +434,8 @@ async def _kernel_busy_oob(kernel_id: str, backend: str = LOCAL) -> bool:
         return False
 
 
-async def _await_uncapped(task: asyncio.Future, kernel_id: str, backend: str) -> dict[str, Any]:
+async def _await_uncapped(task: asyncio.Future, kernel_id: str, backend: str,
+                          started: threading.Event) -> dict[str, Any]:
     """Wait for an execution with no hard cap — but notice if the kernel stops running it.
 
     `execute_interactive` returns only on an iopub `idle` whose parent matches ITS request.
@@ -302,18 +445,23 @@ async def _await_uncapped(task: asyncio.Future, kernel_id: str, backend: str) ->
     kernel would answer `busy` for the life of the process. Two consecutive non-busy
     observations mean our execution is gone, whatever the library still believes.
 
-    Never cancels the task — a watchdog that killed the work would defeat the whole point."""
+    Never cancels the task — a watchdog that killed the work would defeat the whole point.
+    `started` gates the whole judgment: until the pool work item is running, an idle
+    kernel proves nothing (a queued item behind a saturated pool looks identical)."""
     misses = 0
     while True:
         done, _ = await asyncio.wait({task}, timeout=_LIVENESS_INTERVAL_SEC)
         if done:
             return task.result()
+        if not started.is_set():
+            continue
         if await _kernel_is_running(kernel_id, backend):
             misses = 0
             continue
         misses += 1
         if misses >= 2:
-            await _drop_client(kernel_id)   # let the orphaned worker unwind
+            await _drop_client(kernel_id)   # wake + let the orphaned worker unwind
+            _orphan_worker(task, kernel_id, started)
             raise RuntimeError(
                 f"kernel '{kernel_id}' stopped running this execution before it finished — it "
                 "was restarted or died underneath it (a manual restart in JupyterLab, or the "
@@ -355,22 +503,44 @@ async def exec_local(kernel_id: str, backend: str, code: str, timeout: float | N
                 "timed_out": False}
     try:
         kc = await _get_client(kernel_id)
+        # Refuse rather than queue: a work item queued on a saturated pool reads
+        # 'kernel idle' to the liveness watchdog on a healthy kernel and later runs
+        # user code after the caller was told to re-run — a double execution. The
+        # pool count includes orphaned workers parked on dead kernels, which is the
+        # only way a full pool stays full.
+        global _exec_inflight
+        if _exec_inflight >= _EXEC_POOL_WORKERS:
+            raise RuntimeError(
+                f"all {_EXEC_POOL_WORKERS} exec workers are busy or parked on dead "
+                "kernels; restart the mcp service")
         # jupyter_client's `timeout` does NOT bound total run time; enforce it here.
         # The worker thread can't be cancelled, so shield it, interrupt on timeout,
         # then wait a grace for it to unwind — holding the per-kernel lock throughout.
-        task = asyncio.ensure_future(
-            asyncio.to_thread(_execute_streaming, kc, code, sink, (to or 0) + _LIB_DEADLINE_SEC))
+        # It runs on the dedicated _exec_pool so a never-answering kernel parks a
+        # worker here instead of starving the shared default executor.
+        started = threading.Event()
+        task = asyncio.get_running_loop().run_in_executor(
+            _exec_pool, partial(_worker_entry, kc, code, sink,
+                                (to or 0) + _LIB_DEADLINE_SEC, started))
+        _exec_inflight += 1
+        task.add_done_callback(_exec_done)
         try:
             # No hard cap (`to` == 0): wait for the work itself, watching the kernel rather
             # than a clock. Detaching (state.run_single_flight) is what keeps the CALLER
             # responsive; nothing here kills the execution, so a long job is never truncated.
             reply = (await asyncio.wait_for(asyncio.shield(task), timeout=to) if to
-                     else await _await_uncapped(task, kernel_id, backend))
+                     else await _await_uncapped(task, kernel_id, backend, started))
         except TimeoutError:
             log.info("execute exceeded %.0fs on %s; interrupting", to, kernel_id)
             try:
-                await _rest_post(f"/api/kernels/{kernel_id}/interrupt", backend=backend)
-                reply = await asyncio.wait_for(asyncio.shield(task), timeout=15)
+                # Only an execution that STARTED can be interrupted — a queued item
+                # has nothing running on the kernel to interrupt; wait for it
+                # the same way the uncapped path does (gated on `started`).
+                if started.is_set():
+                    await _rest_post(f"/api/kernels/{kernel_id}/interrupt", backend=backend)
+                    reply = await asyncio.wait_for(asyncio.shield(task), timeout=15)
+                else:
+                    reply = await _await_uncapped(task, kernel_id, backend, started)
             except TimeoutError:
                 # The interrupt did not land. Do NOT return yet: the kernel is still running
                 # our code, and returning would release the single-flight claim (ADR 0017)
@@ -380,7 +550,7 @@ async def exec_local(kernel_id: str, backend: str, code: str, timeout: float | N
                 log.info("interrupt did not unwind on %s; waiting for the kernel to go idle",
                          kernel_id)
                 try:
-                    reply = await _await_uncapped(task, kernel_id, backend)
+                    reply = await _await_uncapped(task, kernel_id, backend, started)
                 except RuntimeError:
                     await _drop_client(kernel_id)
                     return {"status": "timeout", "execution_count": None,
@@ -392,6 +562,7 @@ async def exec_local(kernel_id: str, backend: str, code: str, timeout: float | N
             reply["timed_out"] = True
             return reply
         except Exception as e:  # noqa: BLE001
+            _orphan_worker(task, kernel_id, started)
             await _drop_client(kernel_id)
             raise RuntimeError(f"execution failed: {e}") from e
     finally:

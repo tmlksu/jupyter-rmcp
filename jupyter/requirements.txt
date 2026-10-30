@@ -1,4 +1,7 @@
 # Default scientific stack available in every kernel. Extend as needed, then rebuild.
+# jupyter_server floor: 2.18 fixed a contents-path root-escape and its
+# AsyncLargeFileManager is what our chunked uploads rely on (audit #13, ADR 0021).
+jupyter_server>=2.18
 numpy
 pandas
 matplotlib

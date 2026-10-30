@@ -50,7 +50,10 @@ async def _health(_request: Request) -> JSONResponse:
     # EXEC_TIMEOUT_SEC silently reintroduces the interrupt this server no longer wants).
     return JSONResponse({"status": "ok", "jupyter": backend, "colab_only": config.COLAB_ONLY,
                          "soft_reply_deadline_sec": config.SOFT_REPLY_DEADLINE_SEC,
-                         "exec_hard_timeout_sec": config.EXEC_TIMEOUT_SEC})
+                         "exec_hard_timeout_sec": config.EXEC_TIMEOUT_SEC,
+                         "exec_workers": {"active": local_jupyter._exec_inflight,
+                                          "orphaned": local_jupyter._orphaned_exec_workers,
+                                          "max": local_jupyter._EXEC_POOL_WORKERS}})
 
 
 # DNS-rebinding/Origin guard (ADR 0019): FastMCP's guard is OFF unless

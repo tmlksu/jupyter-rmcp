@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -143,36 +144,51 @@ def classify_result(rc: int, out: str) -> ColabOutcome:
 # =============================================================================
 # colab-cli subprocess (the ONLY place that shells out to `colab`)
 # =============================================================================
-async def _colab_cli(*args: str, input_text: str | None = None, timeout: float = 300.0) -> tuple[int, str]:
+async def _colab_cli(*args: str, input_text: str | None = None, timeout: float = 300.0,
+                     abort_check: Any = None) -> tuple[int, str]:
     """Run the official `colab` CLI (google-colab-cli) with ADC auth. Returns
-    (returncode, combined_output)."""
+    (returncode, combined_output).
+
+    `abort_check`: optional sync callable polled ~twice a second while the
+    subprocess runs. When it returns a reason string, the process is killed and
+    RuntimeError(reason) is raised — the caller's own condition (e.g. a landing
+    file growing past a cap), not a clock."""
     proc = await asyncio.create_subprocess_exec(
         "colab", "--auth", "adc", *args,
         stdin=asyncio.subprocess.PIPE if input_text is not None else None,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
-    try:
-        out, _ = await asyncio.wait_for(
-            proc.communicate(input_text.encode() if input_text is not None else None),
-            timeout=timeout,
-        )
-    except TimeoutError:
-        proc.kill()
-        # Best-effort: drain whatever the (now-killed) process already emitted so a
-        # timeout doesn't discard partial stdout. communicate() was cancelled so some
-        # buffered bytes may be lost, but any remaining in the pipe are recoverable.
-        partial = b""
-        try:
-            if proc.stdout is not None:
-                partial = await asyncio.wait_for(proc.stdout.read(), timeout=5)
-        except Exception:  # noqa: BLE001
-            pass
-        await proc.wait()
-        txt = partial.decode(errors="replace")
-        marker = f"[colab-cli timed out after {timeout:.0f}s]"
-        # rc 124 is our timeout sentinel (callers key off it to report status="timeout").
-        return 124, (f"{txt}\n{marker}" if txt else marker)
-    return proc.returncode, out.decode(errors="replace")
+    comm = asyncio.ensure_future(
+        proc.communicate(input_text.encode() if input_text is not None else None))
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            comm.cancel()
+            proc.kill()
+            # Best-effort: drain whatever the (now-killed) process already emitted so
+            # a timeout doesn't discard partial stdout. communicate() was cancelled so
+            # some buffered bytes may be lost, but any remaining in the pipe are
+            # recoverable.
+            partial = b""
+            try:
+                if proc.stdout is not None:
+                    partial = await asyncio.wait_for(proc.stdout.read(), timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+            await proc.wait()
+            txt = partial.decode(errors="replace")
+            marker = f"[colab-cli timed out after {timeout:.0f}s]"
+            # rc 124 is our timeout sentinel (callers key off it for status="timeout").
+            return 124, (f"{txt}\n{marker}" if txt else marker)
+        done, _ = await asyncio.wait({comm}, timeout=min(0.5, remaining))
+        if done:
+            out, _ = comm.result()
+            return proc.returncode, out.decode(errors="replace")
+        if abort_check is not None and (reason := abort_check()):
+            proc.kill()
+            await asyncio.wait({comm}, timeout=5)
+            raise RuntimeError(reason)
 
 
 # =============================================================================

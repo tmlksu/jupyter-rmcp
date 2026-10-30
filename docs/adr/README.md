@@ -28,3 +28,4 @@ New ADR: copy the shape of an existing one, next number, add a row below.
 | [0018](0018-soft-reply-deadline.md) | Answer before the client gives up: soft deadline, detach, never interrupt | Accepted |
 | [0019](0019-mcp-origin-guard.md) | Validate Origin on /mcp; keep Host validation opt-in | Accepted |
 | [0020](0020-jupyter-xsrf-origin.md) | Restore XSRF + Origin checks on the Jupyter server | Accepted |
+| [0021](0021-transfer-hardening.md) | Transfer hardening: bounded fetches, SSRF guard + IP pinning, chunked upload | Accepted |
